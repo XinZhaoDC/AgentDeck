@@ -38,7 +38,7 @@ export interface ProviderProfile {
 
 export interface ProxyConfig {
   mode: 'direct' | 'proxy';
-  preset: 'justdowork' | 'custom';
+  preset: 'standard' | 'compatible' | 'justdowork' | 'custom';
   apiFormat?: 'anthropic' | 'responses';
   overrides?: Partial<ProxyOptions>;
 }
@@ -107,7 +107,7 @@ export interface NetworkTestResult {
 
 export interface UsageQueryConfig {
   enabled: boolean;
-  preset?: 'auto' | 'generic' | 'deepseek' | 'siliconflow' | 'openrouter' | 'newapi' | 'custom';
+  preset?: 'auto' | 'generic' | 'deepseek' | 'siliconflow' | 'moonshot' | 'stepfun' | 'novita' | 'openrouter' | 'openrouter-credits' | 'newapi' | 'newapi-key' | 'sub2api' | 'sub2api-account' | 'openai-credit' | 'custom';
   url: string;
   remainingPath: string;
   usedPath?: string;
@@ -122,6 +122,7 @@ export interface UsageQueryResult {
   endpoint?: string;
   httpStatus?: number;
   remaining?: number;
+  unlimited?: boolean;
   used?: number;
   total?: number;
   unit?: string;
@@ -166,6 +167,7 @@ export interface PublicConfigFile {
 }
 
 export interface ResolvedProvider {
+  historySource?: import('./storage/historySources').HistorySourceBinding;
   claude?: {
     providerId: string;
     providerName: string;
@@ -198,7 +200,7 @@ export interface StatusState {
   detail?: string;
 }
 
-export type ApiStatusKind = 'off' | 'unactivated' | 'ready' | 'missingKey' | 'modelsStale' | 'degraded' | 'networkError' | 'signedIn' | 'loginRequired';
+export type ApiStatusKind = 'off' | 'unactivated' | 'ready' | 'missingKey' | 'modelsStale' | 'degraded' | 'networkError' | 'signedIn' | 'loginRequired' | 'nativeAuth';
 
 export interface ApiStatusRow {
   tool: ToolId;

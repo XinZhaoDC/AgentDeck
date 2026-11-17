@@ -1,9 +1,16 @@
 import { ProxyConfig, ProxyOptions, ToolId } from '../types';
 
+export const PROXY_PRESETS = [
+  { id: 'standard', label: '标准协议转发', description: '保留完整历史、工具结果、工具说明和客户端输出上限；不改工具名、不代执行联网工具、不强加思考预算。' },
+  { id: 'compatible', label: '流式与工具 JSON 兼容', description: '采用标准转发参数，增加工具 JSON 修复及最多两次上游尝试；只在尚未输出响应时重试。' },
+  { id: 'justdowork', label: 'justdowork 专用兼容', description: '保留原有工具名映射、文本工具协议、联网工具及历史/输出限制；仅在上游确实需要时使用。' },
+  { id: 'custom', label: '自定义上游', description: '保留旧版自定义默认值；可在高级设置调整路径、认证、参数、限额和工具处理。' }
+] satisfies Array<{ id: ProxyConfig['preset']; label: string; description: string }>;
+
 export function proxyDefaults(preset: ProxyConfig['preset'], apiFormat: ProxyConfig['apiFormat'] = 'anthropic'): ProxyOptions {
   const jdw = preset === 'justdowork';
   const responses = apiFormat === 'responses';
-  return {
+  const options: ProxyOptions = {
     messagesPath: responses ? '/v1/responses' : '/v1/messages', authMode: responses ? 'bearer' : jdw ? 'both' : 'x-api-key', authHeader: 'x-api-key',
     headers: {}, parameters: {}, rebuildStream: true, toolInjection: jdw && !responses,
     repairToolJson: true, nativeToolMap: jdw && !responses ? { Read: 'read', Write: 'write', Edit: 'edit', Bash: 'bash' } : {},
@@ -12,19 +19,24 @@ export function proxyDefaults(preset: ProxyConfig['preset'], apiFormat: ProxyCon
     extraThinkingBudget: 0, maxThinkingBudget: responses ? 0 : 8000, cacheSystemPrefix: jdw,
     webTools: jdw, webSearchResults: 6, webFetchMaxChars: 20000, maxWebIterations: 3
   };
+  if (preset === 'standard' || preset === 'compatible') Object.assign(options, {
+    toolDescriptionChars: 0, maxHistoryChars: 0, maxToolResultChars: 0, maxOutputTokens: 0,
+    maxThinkingBudget: 0, repairToolJson: preset === 'compatible', maxAttempts: preset === 'compatible' ? 2 : 1
+  });
+  return options;
 }
 
 export function resolveProxyOptions(config?: ProxyConfig): ProxyOptions {
-  const defaults = proxyDefaults(config?.preset ?? 'justdowork', config?.apiFormat);
+  const defaults = proxyDefaults(config?.preset ?? 'standard', config?.apiFormat);
   return { ...defaults, ...config?.overrides };
 }
 
 /** Overrides are portable provider metadata; authentication stays in SecretStorage. */
 export function normalizeProxyConfig(value: unknown, tool: ToolId): ProxyConfig {
-  if (!value || typeof value !== 'object') return { mode: 'direct', preset: 'justdowork', ...(tool === 'codex' ? { apiFormat: 'responses' as const } : {}) };
+  if (!value || typeof value !== 'object') return { mode: 'direct', preset: 'standard', ...(tool === 'codex' ? { apiFormat: 'responses' as const } : {}) };
   const input = value as ProxyConfig;
   if (input.mode !== 'direct' && input.mode !== 'proxy') throw new Error('Invalid proxy connection mode');
-  if (input.preset !== 'justdowork' && input.preset !== 'custom') throw new Error('Invalid proxy preset');
+  if (!PROXY_PRESETS.some(preset => preset.id === input.preset)) throw new Error('Invalid proxy preset');
   const apiFormat = input.apiFormat ?? (tool === 'codex' ? 'responses' : 'anthropic');
   if (!['anthropic', 'responses'].includes(apiFormat)) throw new Error('Invalid upstream API format');
   if (tool === 'claude' && apiFormat !== 'anthropic') throw new Error('Claude Code requires an Anthropic upstream');

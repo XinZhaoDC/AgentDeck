@@ -1,3 +1,4 @@
+import { HistoryImports } from '../../../storage/historyImports';
 import { EnvironmentState } from '../../../storage/environmentState';
 import * as vscode from 'vscode';
 import * as fs from 'fs/promises';
@@ -9,25 +10,27 @@ import { confirmCodexChange } from '../../../shared/runtimeGuard';
 
 const ROOT = 'vscodemodelswitch.codexIdentityStorage';
 export interface SessionState {
-  root?: string; runtimeHome: string; identities: CodexIdentity[]; activeId?: string; viewId?: string;
+  root?: string; runtimeHome: string; runtimeConfigDir?: string; identities: CodexIdentity[]; activeId?: string; viewId?: string;
   attached: boolean; legacy?: boolean; restartRequired?: boolean; sessions: SessionSummary[];
   message?: string; environment: string; environmentId: string;
+  nativeHistory?: { importedCount?: number; workspace?: string; project?: string; owned?: boolean; error?: string; legacyMapping?: boolean; index?: 'legacy' | 'ready' | 'error' };
 }
-export type SessionAction = 'configure' | 'add' | 'rename' | 'switch' | 'refresh' | 'backup' | 'restore' | 'reload' | 'openFolder' | 'exportProviders' | 'manageBackups' | 'deleteHistoryBackups' | 'help';
+export type SessionAction = 'configure' | 'add' | 'rename' | 'switch' | 'refresh' | 'refreshHistory' | 'selectHistoryProject' | 'clearHistoryProject' | 'labelHistoryProject' | 'openNativeHistory' | 'backup' | 'restore' | 'reload' | 'openFolder' | 'exportProviders' | 'manageBackups' | 'deleteHistoryBackups' | 'help';
 
 /** No migration, credential reuse or login is triggered by installation. */
 export class SessionController {
   private restartRequired = false;
   private message?: string;
   private recoveryError?: string;
+  private indexing = false;
   activeId?: string;
   readonly ready: Promise<void>;
   constructor(private readonly context: vscode.ExtensionContext, private readonly environmentState = new EnvironmentState(context),
-    private readonly prepareStorage?: (root: string) => Promise<() => Promise<void>>) {
+    private readonly prepareStorage?: (root: string) => Promise<() => Promise<void>>, private readonly rebuildIndex?: (home: string, sqlite: string) => Promise<void>) {
     this.ready = this.initialize();
   }
   private profiles(root = this.environmentState.get<string>(ROOT)): CodexProfiles | undefined {
-    return root ? new CodexProfiles(root, getToolHome('codex'), this.environmentState.id) : undefined;
+    return root ? new CodexProfiles(root, getToolHome('codex'), this.environmentState.id, undefined, this.rebuildIndex) : undefined;
   }
   private async initialize(): Promise<void> {
     await this.environmentState.ready;
@@ -46,8 +49,13 @@ export class SessionController {
         await this.environmentState.update(ROOT + '.pending', undefined);
       }
       const profiles = this.profiles();
-      if (profiles && (await profiles.read()).version === 2) this.message = await profiles.recover() ?? this.message;
+      if (profiles && (await profiles.read()).version === 2) {
+        this.message = await profiles.recover() ?? this.message;
+        const m = await profiles.read(), active = m.identities.find(i => i.id === m.activeId);
+        if (active) await new HistoryImports(profiles.root, 'codex', active, this.environmentState.id, '').recover();
+      }
     } catch (error) { this.recoveryError = this.message = error instanceof Error ? error.message : String(error); }
+    if (!this.recoveryError && this.rebuildIndex) await this.refreshHistoryIndex();
   }
   async state(): Promise<SessionState> {
     await this.ready;
@@ -58,18 +66,30 @@ export class SessionController {
     try {
       const m = await p.read(); this.activeId = m.activeId;
       let attached = true; try { await p.assertAttached(m); } catch { attached = false; }
-      return { ...base, root: p.root, identities: m.identities, activeId: m.activeId, attached, legacy: m.version === 1 };
+      return { ...base, root: p.root, identities: m.identities, activeId: m.activeId, attached, legacy: m.version === 1, nativeHistory: { index: attached ? await p.localIndexActive() ? 'ready' : 'legacy' : 'error' } };
     } catch { return { ...base, root: p.root, message: this.recoveryError ?? '数据目录不可用，请检查挂载后刷新状态或重新连接。' }; }
   }
   get recoveryBlocked(): boolean { return Boolean(this.recoveryError); }
   reportRecoveryFailure(error: unknown): void { this.recoveryError = this.message = error instanceof Error ? error.message : String(error); }
   assertReady(): void {
+    if (this.indexing) throw new Error('原生历史索引正在刷新，请完成后再切换账号或目录。');
     if (this.recoveryError) throw new Error(this.recoveryError);
     if (process.platform === 'win32' && vscode.workspace.getConfiguration('chatgpt').get<boolean>('runCodexInWindowsSubsystemForLinux', false)) throw new Error('官方 Codex 当前运行于 WSL，请在对应 WSL 窗口运行 AgentDeck 后再绑定目录，避免修改错误的 Windows CODEX_HOME。');
     if (this.restartRequired) throw new Error('账号绑定已改变，请先重载窗口，让 Codex 重新读取目录。');
   }
   recoveryDirectory(): string { return this.profiles()?.recoveryDirectory ?? join(getToolHome('codex'), '.recovery', 'current'); }
-  async refresh(): Promise<void> { await this.ready; await this.state(); }
+  async refresh(): Promise<void> { await this.ready; await this.state(); if (this.rebuildIndex) await this.refreshHistoryIndex(); }
+  async refreshHistoryIndex(): Promise<void> {
+    if (this.indexing || this.restartRequired || this.recoveryError) return;
+    const p = this.profiles(); if (!p) return;
+    this.indexing = true;
+    try {
+      if (!await p.localIndexActive()) { this.message = '当前仍使用旧共享索引。请结束客户端任务后，点击“修复/刷新原生历史”，为本环境建立索引。'; return; }
+      await p.refreshIndex();
+      this.message = '本环境原生历史索引已刷新；聊天文件仍按账号共享。';
+    } catch { this.message = '本环境原生历史索引未能刷新，请检查挂载、权限和客户端版本后重试。'; }
+    finally { this.indexing = false; }
+  }
   async confirmChange(operation: string): Promise<boolean> { await this.ready; this.assertReady(); await this.assertHomeOwner(); return confirmCodexChange(operation); }
   async ensureMode(kind: IdentityKind): Promise<void> {
     await this.ready; this.assertReady(); await this.assertHomeOwner();
@@ -98,6 +118,14 @@ export class SessionController {
     await this.ready;
     if (action === 'reload') { await vscode.commands.executeCommand('workbench.action.reloadWindow'); return; }
     if (action === 'refresh') { await this.refresh(); return; }
+    if (action === 'refreshHistory') {
+      const p = this.profiles(); if (!p) throw new Error('请先连接数据目录。');
+      if (!await this.confirmChange('修复本环境原生历史索引（保留共享聊天和原索引）')) throw new Error('已取消：历史索引未更改。');
+      this.indexing = true;
+      try { await p.refreshIndex(true); this.restartRequired = true; this.message = '本环境原生历史索引已重建；请重载窗口，原聊天与登录保持。'; }
+      finally { this.indexing = false; }
+      return;
+    }
     if (action === 'configure') { await this.configure(initialKind); return; }
     const p = this.profiles(); if (!p) throw new Error('请先设置统一数据目录。');
     const m = await p.read();
@@ -111,7 +139,7 @@ export class SessionController {
     }
     const identity = m.identities.find(i => i.id === (id ?? m.activeId)); if (!identity) throw new Error('请选择账号档案。');
     if (action === 'rename') {
-      const name = await vscode.window.showInputBox({ title: '修改账号别名', value: identity.name, ignoreFocusOut: true });
+      const name = await vscode.window.showInputBox({ title: '重命名账号档案', value: identity.name, ignoreFocusOut: true });
       if (!name) throw new Error('已取消：账号名称未更改。');
       await p.rename(identity.id, name); return;
     }
@@ -138,9 +166,10 @@ export class SessionController {
     await assertOutsideRepository(folder);
     const root = basename(folder).toLowerCase() === 'codex' ? folder : join(folder, 'codex');
     const previous = this.environmentState.get<string>(ROOT);
-    const p = new CodexProfiles(root, getToolHome('codex'), this.environmentState.id, () => this.environmentState.update(ROOT, root));
+    const p = new CodexProfiles(root, getToolHome('codex'), this.environmentState.id, () => this.environmentState.update(ROOT, root), this.rebuildIndex);
     let initialize = !await exists(join(root, 'profiles.json'));
     let identityId: string | undefined;
+    let createApi = false;
     let legacy: string | undefined;
     if (previous && previous !== root && await exists(join(previous, 'identities.json'))) legacy = previous;
     if (!legacy) {
@@ -156,8 +185,10 @@ export class SessionController {
     if (!initialize) {
       const m = await p.read(); initialize = !m.identities.length;
       if (!initialize) {
-        const selected = await vscode.window.showQuickPick(m.identities.map(identity => ({ label: identity.name, description: identity.kind === 'official' ? '共享历史；本环境独立登录' : '所有 API 供应商共用历史', identity })), { title: '将当前环境连接到哪个账号档案？不会覆盖或合并当前历史。' });
-        if (!selected) throw new Error('已取消：数据目录未更改。'); identityId = selected.identity.id;
+        const options: Array<{ label: string; description: string; identity?: CodexIdentity; createApi?: boolean }> = (kind === 'api' ? m.identities.filter(i => i.kind === 'api') : m.identities).map(identity => ({ label: identity.name, description: identity.kind === 'official' ? '共享历史；本环境独立登录' : '连接已有 API 共享历史；不自动合并当前历史', identity }));
+        if (kind === 'api' && !options.length) options.push({ label: '新建 API 共享历史并迁入当前 API 历史', description: '保留已有官方档案；当前 API 配置和认证留在本环境', createApi: true });
+        const selected = await vscode.window.showQuickPick(options, { title: kind === 'api' ? '连接 API 数据目录（保持 API 模式）' : '将当前环境连接到哪个账号档案？不会覆盖或合并当前历史。' });
+        if (!selected) throw new Error('已取消：数据目录未更改。'); identityId = selected.identity?.id; createApi = selected.createApi === true;
       }
     }
     if (legacy && initialize) {
@@ -165,12 +196,15 @@ export class SessionController {
       if (!choice) throw new Error('已取消：数据目录未更改。'); if (!choice.migrate) legacy = undefined;
     }
     if (!await this.confirmChange('连接/迁入 Codex 数据目录')) throw new Error('已取消：数据目录未更改。');
+    // Prepare the shared group-writable parent before private environment logs;
+    // recursive mkdir(0700) from the logger otherwise seals the shared root.
+    await p.createLayout();
     const undoLogs = await this.prepareStorage?.(root);
     let pendingCleanup = false;
     try {
       await this.environmentState.update(ROOT + '.pending', { next: root, previous });
       if (legacy && initialize) await p.importLegacy(legacy);
-      else if (initialize) await p.initialize(kind);
+      else if (initialize || createApi) await p.initialize(kind, createApi);
       else await p.attach(identityId);
       // onActivated already saved ROOT inside the filesystem transaction.
       // Clearing its discovery pointer is housekeeping after commit: failure

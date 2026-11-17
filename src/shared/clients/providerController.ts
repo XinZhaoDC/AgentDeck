@@ -27,7 +27,7 @@ export abstract class ProviderClientController<H extends ProviderClientHost = Pr
         }
         case 'createProvider':
           await this.host.createProviderFromSidebar(message.payload);
-          await this.reply({ type: 'providerCreated' }); break;
+          await this.reply({ type: 'providerCreated', tool: this.id, name: message.payload.name.trim() }); break;
         case 'setCurrentProvider': await this.host.setCurrentProviderFromSidebar(message.providerId); break;
         case 'openProviderConfig': {
           const config = await this.host.getProviderConfigFromSidebar(message.providerId);
@@ -55,8 +55,8 @@ export abstract class ProviderClientController<H extends ProviderClientHost = Pr
         case 'viewConfig': await this.host.viewConfigFromSidebar(message.tool); break;
         case 'exportPublicConfig': await this.host.exportPublicConfigFromSidebar(this.id); break;
         case 'importPublicConfig': await this.host.importPublicConfigFromSidebar(this.id); break;
-        case 'clearLog': if (!await this.host.clearLogFromSidebar()) throw new Error('已取消：日志未删除。'); break;
-        case 'logAction': await this.host.logActionFromSidebar(message.action); break;
+        case 'clearLog': if (!await this.host.clearLogFromSidebar(this.id)) throw new Error('已取消：日志未删除。'); break;
+        case 'logAction': await this.host.logActionFromSidebar(message.action, this.id); break;
         case 'applyNetworkProxy': await this.host.applyNetworkProxyFromSidebar(message.config, message.tool); break;
         case 'restoreNetworkProxy': await this.host.restoreNetworkProxyFromSidebar(message.tool); break;
         case 'testNetworkProxy': await this.host.testNetworkProxyFromSidebar(message.config, message.tool); break;

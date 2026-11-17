@@ -1,6 +1,35 @@
 # AgentDeck
 
-本次发布的 Codex 专项验收、宿主机测试步骤与换账号接手开发，请阅读[宿主机验收](docs/host-acceptance.md)及[开发交接入口](docs/development-handoff.md)。仓库目录改为 `AgentDeck`；内部扩展身份和已有用户数据保持不变。
+当前发布版本：**v0.12.14**。双客户端管理、独立网络、供应商模板、跨环境历史与三级标签的完整变更及升级前提见[发布说明](docs/development-log.md)。
+
+**0.12.14**：历史标签设置中的按钮独立全宽对齐，说明紧随对应按钮；索引状态单独提示，API 来源操作说明折叠保留。
+
+**0.12.13**：Codex 的“升级/刷新原生历史索引”移入“数据与存储 → 历史标签设置”，附专属用途与操作说明；Claude 隐藏该区域。
+
+**0.12.12**：新 API 聊天按原生新会话事件记录的 API 名称分组，旧未知来源不追溯。保留共享 API profile、三级标签及原历史选择；升级后重新应用当前 API 并重载，Codex 首次需在原生 `/hooks` 信任来源记录命令。见[历史管理](docs/management.md)。
+
+**0.12.11**：两客户端历史标签页增加分区导航、当前位置、三级颜色框线与不同深浅背景，区分原名与显示标签；结构树勾选或编辑时保留展开状态。已登记环境与“环境未标注”的区别、原生索引用途见[历史管理](docs/management.md)。
+
+**0.12.10**：数据与存储新增“历史标签管理”，统一官方帐号/API来源、环境、项目三级标签与历史树预览。标签与原名同时显示，环境/项目跨帐号和模式复用，不同路径可关联同一项目标签；支持批量手动归类API来源及环境，保留原profiles/路径与已添加状态。见[历史管理](docs/management.md)。
+
+**0.12.9**：修复Codex升级原生索引时普通session_index.jsonl阻塞：合并名称并保留原文件，后续失败恢复。两页“项目环境归属”改为“设置历史项目的环境标签…”，仅用于历史分组/排序，不移动聊天。
+
+**0.12.8**：两页支持跨官方帐号／API 档案按“帐号 → 环境 → 项目 → 聊天”多选。选择页只增量添加，已显示项灰显；在“管理已显示历史”多选移除。独立续聊副本保护来源记录，移除保留续聊，新聊天位置不变；保留现有 profiles、认证与网络独立。见[历史管理](docs/management.md)和[验收步骤](docs/host-acceptance.md)。
+
+**0.12.4**：修复 Claude 停用代理后重载的状态误报，兼容旧版遗留标记；真正的恢复冲突仍会报警。停用后输入框保留草稿是正常现象，见[网络说明](docs/network-proxy.md)。
+
+**0.12.3**：两个页面添加 API 成功后清空名称与密钥，失败保留输入；名称支持历史联想，按客户端分别记忆，密钥不进入联想记录。见[管理说明](docs/management.md)。
+
+**0.12.2**：Codex / Claude 群组折叠改为箭头按钮；请求处理新增标准转发与工具 JSON 兼容预设，余额查询补齐 Sub2API、New API Key 与账户区分等规则，并可展开调整接口和换算参数。whu-usi 已通过只读余额测试；用法见[API 预设说明](docs/api-presets.md)。
+**0.12.0**：Claude Code 采用与 Codex 一致的管理布局、群组设置模板和账号/API 操作；原生配置目录保留登录状态，切换模式不退出账号。Claude 网络覆盖扩展及同目录 CLI，账号切换保持已应用路由；外部终端、浏览器和真实登录边界见[账号与存储](docs/management.md)及[网络说明](docs/network-proxy.md)。两客户端配置、网络、数据和日志独立；安装不会自动迁移或切换真实账号。
+
+本次发布的两客户端验收、宿主机测试步骤与换账号接手开发，请阅读[宿主机验收](docs/host-acceptance.md)及[开发交接入口](docs/development-handoff.md)。仓库目录改为 `AgentDeck`；内部扩展身份和已有用户数据保持不变。
+
+**0.11.1** gives Codex annotations consistent blue rails and graded outlines. Official accounts and API providers share a prominent current-use badge/button, while unapplied API buttons stay neutral and pending edits remain actionable. Proxy status now distinguishes applied, unapplied and abnormal configurations.
+
+**0.11.0** combines request handling and balance queries into group settings templates, adds optional group API addresses and one-time initialization for new providers, and removes group-specific networking. Network presets visibly include bypass targets. Codex uses layered theme-aware panels and editors nested inside the selected provider; deleting a group keeps its members and their individual availability. Templates exclude API keys and management tokens.
+
+**0.10.1** fixes shared-directory access across Linux host/container UIDs and adds Codex ON/OFF switches, hold-to-drag ordering, single-step arrows and clearer template copy semantics. Group-shared storage uses POSIX default ACLs (setfacl/getfacl); see [storage management](docs/management.md) for repairing existing directories and rolling back permissions.
 
 **0.10.0** adds Codex provider groups, empty groups, drag ordering, environment-local availability, reusable request templates and v2 configuration exports/imports. Registered client controllers and views provide an extension point for additional agents. Existing providers and shared API history are preserved. See [client architecture and groups](docs/client-architecture.md).
 

@@ -3,7 +3,7 @@
 // It checks structure/events/state, not browser layout or VS Code rendering.
 const assert = require('node:assert/strict');
 const vm = require('node:vm');
-function sidebarFixture(html, initialViewState = {}) {
+function sidebarFixture(html, initialViewState = {}, extraGlobals = {}) {
   const messages = [], windowListeners = {}, documentListeners = {};
   let viewState = initialViewState, scrollCalls = 0, now = Date.now(), nextTimer = 0;
   const timers = new Map();
@@ -44,7 +44,7 @@ function sidebarFixture(html, initialViewState = {}) {
     scrollIntoView() { scrollCalls++; } focus() {}
   }
   const descend = parent => parent.children.flatMap(e => [e, ...descend(e)]);
-  const match = (e, selector) => selector.startsWith('.') ? e.classList.contains(selector.slice(1)) : selector.startsWith('#') ? e.id === selector.slice(1)
+  const match = (e, selector) => /^[a-z]+\[data-[a-z-]+\]$/i.test(selector) ? e.tagName === selector.split('[')[0].toUpperCase() && Object.hasOwn(e.dataset, datasetKey(selector.slice(selector.indexOf('[') + 1, -1))) : selector.startsWith('.') ? e.classList.contains(selector.slice(1)) : selector.startsWith('#') ? e.id === selector.slice(1)
     : selector.startsWith('[data-') ? Object.hasOwn(e.dataset, datasetKey(selector.slice(1, -1))) : e.tagName === selector.toUpperCase();
   const root = new Element('document'), stack = [root];
   const withoutScript = html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/g, '').replace(/<style\b[^>]*>[\s\S]*?<\/style>/g, '');
@@ -70,14 +70,14 @@ function sidebarFixture(html, initialViewState = {}) {
     addEventListener: (name, fn) => { documentListeners[name] = fn; }
   };
   const context = { document, window: { addEventListener: (name, fn) => { windowListeners[name] = fn; }, setTimeout: schedule, clearTimeout: cancel }, Date: FixtureDate,
-    acquireVsCodeApi: () => ({ postMessage: message => messages.push(message), getState: () => viewState, setState: state => { viewState = state; } }), console };
+    acquireVsCodeApi: () => ({ postMessage: message => messages.push(message), getState: () => viewState, setState: state => { viewState = state; } }), console, ...extraGlobals };
   const script = html.match(/<script[^>]*>([\s\S]*)<\/script>/)[1];
   vm.runInNewContext(script, context);
   const elements = new Map(descend(root).filter(e => e.id).map(e => [e.id, e]));
   const fire = message => windowListeners.message({ data: message });
   return { elements, messages, document, fire, context,
     advance(ms) { const end = now + ms; for (;;) { const next = [...timers.entries()].filter(([, x]) => x.at <= end).sort((a, b) => a[1].at - b[1].at)[0]; if (!next) break; now = next[1].at; timers.delete(next[0]); next[1].fn(); } now = end; },
-    toggle(details, open) { details.open = open; documentListeners.toggle({ target: details }); },
+    toggle(details, open) { details.open = open; documentListeners.toggle({ target: details }); details.listeners.toggle?.({ target: details }); },
     get viewState() { return viewState; }, get scrollCalls() { return scrollCalls; } };
 }
 module.exports = { sidebarFixture };

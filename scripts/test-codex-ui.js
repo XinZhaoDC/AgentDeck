@@ -22,6 +22,27 @@ const initial = {
   const notice = key => ui.document.querySelectorAll('[data-operation-feedback]').find(n => n.dataset.operationFeedback === 'codex:' + key);
   const result = (key, status = 'failed', message = 'synthetic failure') => ui.fire({ type: 'operationFeedback', target: 'codex:' + key, page: 'codex', status, message });
   const before = (node, anchor) => { assert.equal(node.parentElement, anchor.parentElement); assert.equal(node.parentElement.children.indexOf(node) + 1, node.parentElement.children.indexOf(anchor)); };
+  await test('native history repair targets Codex storage and is unavailable while reload is pending', () => {
+    finish(initial);
+    const controls=e('codexHistoryIndexControls'), repair=e('refreshNativeHistoryButton');
+    assert.equal(controls.parentElement,e('manageHistoryLabelsButton').parentElement);
+    assert.equal(repair.parentElement,controls);assert.match(controls.className,/historySettingsAction/);
+    assert.doesNotMatch(controls.className,/usageNote|workflowHint/);
+    assert.equal(controls.children[0],repair);before(e('manageHistoryLabelsButton'),e('historyLabelsHelp'));before(repair,e('nativeHistoryIndexHelp'));
+    assert.match(e('nativeHistoryIndexHelp').textContent,/不改变已选历史/);
+    assert.equal(controls.querySelectorAll('button').length,1);
+    assert.equal(e('nativeHistoryIndexStatus').parentElement,controls);assert.doesNotMatch(e('nativeHistoryIndexStatus').className,/usageNote|workflowHint/);
+    const sourceHelp=e('historyLabelsSection').querySelectorAll('[data-fold]').find(n=>n.dataset.fold==='history-api-source-help');
+    assert.equal(sourceHelp.open,false);assert.match(sourceHelp.textContent,/\/hooks/);assert.doesNotMatch(e('historyLabelsHelp').textContent,/\/hooks/);
+    finish({...initial,sessions:{...initial.sessions,nativeHistory:{index:'legacy'}}});
+    assert.equal(e('nativeHistoryIndexStatus').hidden,false);assert.equal(e('nativeHistoryIndexStatus').textContent,'当前索引需要升级；完成后请重载窗口。');
+    finish(initial);assert.equal(e('nativeHistoryIndexStatus').hidden,true);
+    assert.equal(controls.hidden,false);assert.equal(repair.hidden,false);assert.equal(repair.disabled,false);
+    e('refreshNativeHistoryButton').listeners.click();assert.equal(ui.messages.at(-1).type,'sessionAction');assert.equal(ui.messages.at(-1).action,'refreshHistory');
+    finish({...initial,sessions:{...initial.sessions,restartRequired:true}});assert.equal(e('refreshNativeHistoryButton').disabled,true);
+    finish(initial);e('claudePageTab').listeners.click();assert.equal(e('refreshNativeHistoryButton').hidden,true);assert.equal(e('codexHistoryIndexControls').hidden,true);e('codexPageTab').listeners.click();finish(initial);
+    assert.match(e('identityStatus').textContent,/目录链接有效/);
+  });
   await test('Codex module order places data directly below overview', () => {
     const nodes = e('overviewSection').parentElement.children.map(n => n.id);
     const order = ['overviewSection', 'codexDataSection', 'networkSection', 'codexAccountsSection'];
@@ -32,8 +53,8 @@ const initial = {
     assert.equal(e('sessionPanel').parentElement, e('codexAccountsBody')); assert.equal(e('officialAccountsSection').parentElement, e('codexAccountsBody')); assert.equal(e('codexSection').parentElement, e('codexAccountsBody'));
     assert.match(e('codexProvidersDetails').className, /submodule/);
     const networkChildren = e('networkProxyActions').parentElement.children;
-    assert.equal(networkChildren.indexOf(e('networkProxyBadge')) + 1, networkChildren.indexOf(e('networkProxyActions')));
-    assert.ok(networkChildren.indexOf(e('networkProxyActions')) < networkChildren.indexOf(e('networkProxyUrl').parentElement));
+    assert.equal(networkChildren.indexOf(e('networkProxyBadge').parentElement) + 1, networkChildren.indexOf(e('networkProxyActions')));
+    assert.ok(networkChildren.indexOf(e('networkProxyActions')) < networkChildren.indexOf(e('networkPresetEditor')));
     assert.deepEqual(e('networkProxyActions').children.map(n => n.id), ['testNetworkProxyButton', 'applyNetworkProxyButton', 'restoreNetworkProxyButton']);
     assert.match(e('codexAddProviderDetails').className, /submodule/); assert.equal(e('providerForm').parentElement, e('codexAddProviderBody'));
   });
@@ -81,12 +102,13 @@ const initial = {
     e('providerForm').listeners.submit({ preventDefault() {} });
     assert.equal(ui.messages.at(-1).target, 'codex:add'); assert.equal(ui.messages.at(-1).payload.tool, 'codex'); assert.equal(e('saveButton').disabled, true); finish(initial);
   });
-  await test('Claude retains its standalone Add/Configuration and tool collapse layout', () => {
+  await test('Claude shares the module hierarchy while using its own account and provider state', () => {
     e('claudePageTab').listeners.click();
-    assert.equal(e('sessionPanel').hidden, true); assert.equal(e('codexDataSection').hidden, true); assert.equal(e('officialAccountsSection').hidden, true);
-    assert.equal(e('providerForm').parentElement, e('addProviderSection')); assert.equal(e('exportButton').parentElement, e('configurationActions')); assert.equal(e('clearLogButton').className, 'danger');
-    assert.equal(e('overviewTitle').hidden, true); assert.equal(e('networkProxyPanel').className, 'panel');
-    e('codexPageTab').listeners.click(); assert.equal(e('tool').value, 'codex'); assert.equal(e('tool').options.length, 1);
+    assert.equal(e('sessionPanel').hidden, false); assert.equal(e('codexDataSection').hidden, false); assert.equal(e('officialAccountsSection').hidden, false);
+    assert.equal(e('providerForm').parentElement, e('codexAddProviderBody')); assert.equal(e('exportButton').parentElement, e('codexPublicConfigActions')); assert.equal(e('clearLogButton').className, 'danger');
+    assert.equal(e('overviewTitle').hidden, false); assert.equal(e('networkProxyPanel').className, 'module');
+    assert.equal(e('claudeNetworkRouteHelp').hidden, false); assert.match(e('openCodexButton').textContent, /Claude Code/);
+    e('codexPageTab').listeners.click();
   });
   await test('saved speed failure/cancellation is not classified as success', () => {
     const report = { summary: { succeeded: 0, failed: 1, cancelled: 0 }, rounds: [{ error: 'fixture failure' }] };
@@ -179,6 +201,37 @@ const initial = {
     finish({ ...initial, officialInfo: { models: ['Model-原始ID'], windows: [{ usedPercent: 25, minutes: 60 }], unavailable: [] } });
     assert.match(e('officialInfoResult').textContent, /可用模型：Model-原始ID/);
     assert.match(e('officialInfoResult').textContent, /已用 25% \/ 60 分钟/);
+  });
+  await test('proxy badge distinguishes applied, unapplied, legacy and abnormal configurations while draft edits do not change the applied state', () => {
+    finish(initial);assert.match(e('networkProxyBadge').textContent,/未应用代理/);
+    const config={url:'http://127.0.0.1:12000',noProxy:'localhost,127.0.0.1,::1',codex:true,claude:false};
+    finish({...initial,networkProxy:{tools:{codex:{config,managed:true}}}});
+    assert.match(e('networkProxyBadge').textContent,/已应用代理/);assert.ok(e('networkProxyBadge').classList.contains('enabled'));
+    e('networkProxyBypass').value='localhost,.internal.test';e('networkProxyBypass').listeners.input();
+    assert.match(e('networkProxyBadge').textContent,/已应用代理/);assert.match(e('networkProxyStatus').textContent,/草稿有更改待应用/);
+    finish({...initial,networkProxy:{tools:{codex:{config,managed:false}}}});assert.match(e('networkProxyBadge').textContent,/未应用代理/);assert.match(e('networkProxyStatus').textContent,/旧代理设置/);
+    finish({...initial,networkProxy:{tools:{codex:{config,managed:true,error:true}}}});assert.match(e('networkProxyBadge').textContent,/状态异常/);assert.ok(!e('networkProxyBadge').classList.contains('enabled'));assert.equal(e('applyNetworkProxyButton').disabled,false);
+  });
+  await test('unapplied API uses an ordinary Apply button and the applied provider gets a matching current badge and button', () => {
+    finish(initial);
+    const card=id=>e('codexProviders').querySelectorAll('[data-provider-id]').find(n=>n.dataset.providerId===id);
+    const apply=id=>card(id).querySelector('.rowActions').children[0];
+    assert.equal(apply('api-b').textContent,'应用');assert.equal(apply('api-b').className,'');assert.ok(!card('api-b').classList.contains('active'));
+    assert.ok(card('api-a').classList.contains('active'));assert.match(card('api-a').querySelector('.badge').textContent,/当前使用/);assert.equal(apply('api-a').className,'currentUse');assert.equal(apply('api-a').disabled,true);
+    apply('api-b').listeners.click();assert.equal(ui.messages.at(-1).type,'applyProvider');assert.equal(ui.messages.at(-1).providerId,'api-b');
+    const next={...initial,currentProviderIds:{codex:'api-b'}};finish(next);
+    assert.equal(apply('api-a').className,'');assert.equal(apply('api-b').className,'currentUse');assert.ok(!card('api-a').classList.contains('active'));
+    finish({...next,providers:[provider('api-a'),{...provider('api-b'),needsApply:true}]});
+    assert.ok(card('api-b').classList.contains('active'));assert.equal(apply('api-b').textContent,'应用更改');assert.equal(apply('api-b').disabled,false);
+    apply('api-b').listeners.click();assert.equal(ui.messages.at(-1).providerId,'api-b');
+    finish({...next,codexMode:'official',sessions:{...initial.sessions,activeId:'official'}});assert.ok(!card('api-b').classList.contains('active'));assert.equal(card('api-b').querySelector('.badge'),null);
+  });
+  await test('current official account has the same emphasized status as API and a pending binding is not labeled in use', () => {
+    const official={...initial,codexMode:'official',sessions:{...initial.sessions,activeId:'official'}};finish(official);
+    const row=()=>e('officialAccountsList').children.find(n=>n.dataset.identityId==='official');
+    assert.ok(row().classList.contains('active'));assert.match(row().querySelector('.badge').textContent,/当前使用/);assert.equal(row().querySelector('button').className,'currentUse');assert.equal(row().querySelector('button').disabled,true);assert.match(row().textContent,/Official A \/ 账号 A/);
+    finish({...official,sessions:{...official.sessions,restartRequired:true}});assert.ok(!row().classList.contains('active'));assert.equal(row().querySelector('.badge'),null);assert.equal(row().querySelector('button').textContent,'待重载');
+    finish(initial);assert.ok(!row().classList.contains('active'));
   });
   console.log('RESULT: ' + count + ' Codex UI/feedback checks passed, 0 failed');
 })().catch(error => { console.error(error); process.exitCode = 1; });

@@ -80,7 +80,8 @@ async function main() {
   await test('external Claude file changes are detected, not overwritten', async () => {
     const before = await fs.readFile(native, 'utf8'), changed = JSON.parse(before); changed.env.HTTPS_PROXY = 'http://external.invalid:1234'; await fs.writeFile(native, JSON.stringify(changed));
     const external = await fs.readFile(native, 'utf8'); await assert.rejects(manager.restore('claude')); assert.equal(await fs.readFile(native, 'utf8'), external);
-    await fs.writeFile(native, before);
+    await manager.refresh(); assert.equal(manager.state().tools.claude.error, true);
+    await fs.writeFile(native, before); await manager.refresh(); assert.equal(manager.state().tools.claude.error, false);
   });
   await test('restoring Codex leaves Claude route and shared VS Code HTTP configuration untouched', async () => {
     await manager.restore('codex');
@@ -91,6 +92,31 @@ async function main() {
     await manager.restore('claude'); const file = JSON.parse(await fs.readFile(native));
     assert.equal(file.env.HTTPS_PROXY, initialFile.env.HTTPS_PROXY); assert.equal(file.env.ANTHROPIC_AUTH_TOKEN, 'synthetic-new');
     assert.deepEqual(values.claudeCode, originalSettings.claudeCode);
+  });
+  await test('a restart after disabling Claude stays disabled without a false startup error', async () => {
+    const before = await fs.readFile(native, 'utf8'), settings = structuredClone(values.claudeCode);
+    manager.dispose(); manager = new NetworkProxyManager(context, environment); await manager.ready;
+    assert.equal(manager.state().tools.claude.error, false); assert.equal(manager.state().tools.claude.managed, false);
+    assert.equal(manager.state().tools.claude.config, undefined); assert.deepEqual(manager.environment('claude'), {});
+    assert.ok(!state.get('vscodemodelswitch.networkProxy').managedTools.includes('claude'));
+    assert.equal(await fs.readFile(native, 'utf8'), before); assert.deepEqual(values.claudeCode, settings);
+  });
+  await test('old orphan managed flags are ignored without applying a route or rewriting Claude settings', async () => {
+    const previous = structuredClone(state.get('vscodemodelswitch.networkProxy'));
+    const stale = { version: 3, tools: {}, managedTools: ['claude', 'codex'] };
+    state.set('vscodemodelswitch.networkProxy', stale);
+    const before = await fs.readFile(native, 'utf8'), settings = structuredClone(values.claudeCode);
+    manager.dispose(); manager = new NetworkProxyManager(context, environment); await manager.ready;
+    for (const tool of ['claude', 'codex']) { assert.equal(manager.state().tools[tool].error, false); assert.equal(manager.state().tools[tool].managed, false); assert.deepEqual(manager.environment(tool), {}); }
+    assert.deepEqual(state.get('vscodemodelswitch.networkProxy'), stale);
+    assert.equal(await fs.readFile(native, 'utf8'), before); assert.deepEqual(values.claudeCode, settings);
+    state.set('vscodemodelswitch.networkProxy', previous);
+  });
+  await test('a genuinely broken pending recovery still reports an error even with no saved proxy', async () => {
+    const key = environment.key('vscodemodelswitch.networkProxy.backup.pending.claude');
+    secrets.set(key, '{broken synthetic recovery'); await manager.refresh();
+    assert.equal(manager.state().tools.claude.error, true); assert.ok(secrets.has(key));
+    secrets.delete(key); await manager.refresh(); assert.equal(manager.state().tools.claude.error, false);
   });
   await test('failed rollback retains durable setting recovery and retries on restart', async () => {
     stateFailure = true; restoreFailure = true;

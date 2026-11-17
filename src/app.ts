@@ -1,6 +1,7 @@
+import { ClaudeSessionController } from './clients/claude/sessionController';
 import { importOrganization } from './shared/providers/importOrganization';
-import { ProviderOrganizationStore, emptyOrganization, INDEPENDENT_GROUP, normalizedName } from './shared/providers/organization';
-import { CodexOrganizationController, OrganizationAction } from './clients/codex/organizationController';
+import { ProviderOrganizationStore, emptyOrganization, INDEPENDENT_GROUP, normalizedName, groupUsageSettings } from './shared/providers/organization';
+import { ProviderOrganizationController, OrganizationAction } from './shared/providers/controller';
 import { setSectionValue } from './config/tomlEdit';
 import { userFacingError } from './ui/locale';
 import { confirmClientChange } from './shared/runtimeGuard';
@@ -8,7 +9,14 @@ import { readOfficialCodexInfo, OfficialCodexInfo } from './clients/codex/diagno
 import { ReloadState } from './storage/reloadState';
 import { browseFiles } from './ui/fileBrowser';
 import { historyBackups, removeHistoryBackup } from './storage/historyBackups';
-import { SessionController, SessionAction } from './clients/codex/history/controller';
+import { SessionController, SessionAction, SessionState } from './clients/codex/history/controller';
+import { rebuildNativeIndex } from './clients/codex/history/nativeIndex';
+import { maintainOwnedHistory } from './storage/historyPermissions';
+import { HistoryLabels } from './storage/historyLabels';
+import { manageHistoryLabels } from './ui/historyLabelPage';
+import { HistoryImports, sourceTitle } from './storage/historyImports';
+import { pickHistoryTree } from './ui/historyPicker';
+import { getTopLevelStringValue } from './config/tomlEdit';
 import * as fs from 'fs/promises';
 import { basename, dirname, join } from 'path';
 import * as vscode from 'vscode';
@@ -36,7 +44,7 @@ import {
 import { StatusBarController } from './ui/statusBar';
 import { fingerprintSecret } from './utils/hash';
 import { createId, slugify } from './utils/ids';
-import { randomUUID } from 'crypto';
+import { randomUUID, createHash } from 'crypto';
 import { normalizeProxyConfig } from './proxy/config';
 import { ProxyServer } from './proxy/server';
 import { managedProxyId, proxyClientConfig } from './proxy/applied';
@@ -68,7 +76,10 @@ interface AppliedProxyRecord { provider: ProviderProfile; port: number; localUrl
 export class VSModelSwitchApp implements vscode.Disposable {
   private readonly store: ProviderStore;
   private readonly codexOrganization: ProviderOrganizationStore;
-  private readonly codexGroups: CodexOrganizationController;
+  private readonly codexGroups: ProviderOrganizationController;
+  private readonly claudeOrganization: ProviderOrganizationStore;
+  private readonly claudeGroups: ProviderOrganizationController;
+  private readonly claudeSessions: ClaudeSessionController;
   private readonly secretStore: SecretStore;
   private readonly modelResolver: ModelResolver;
   private readonly envManager: EnvManager;
@@ -79,6 +90,12 @@ export class VSModelSwitchApp implements vscode.Disposable {
   private readonly codexAdapter: CodexAdapter;
   private readonly sidebarView: SidebarViewProvider;
   private readonly fileWatchers: vscode.FileSystemWatcher[] = [];
+  private historyWatcher?: vscode.FileSystemWatcher;
+  private claudeHistoryWatcher?: vscode.FileSystemWatcher;
+  private claudeHistoryWatchRoot?: string;
+  private claudeHistoryTimer?: NodeJS.Timeout;
+  private historyWatchRoot?: string;
+  private historyRefreshTimer?: NodeJS.Timeout;
   private readonly runtimeState: Record<ToolId, ToolRuntimeState>;
   private lastEnv: Record<string, string> = {};
   private status: StatusState = { kind: 'off' };
@@ -98,15 +115,20 @@ export class VSModelSwitchApp implements vscode.Disposable {
   private readonly networkProxy: NetworkProxyManager;
   private readonly sessionController: SessionController;
   private readonly operationLog: OperationLog;
+  private readonly claudeOperationLog: OperationLog;
   private readonly logReady: Promise<void>;
 
   constructor(private readonly context: vscode.ExtensionContext, private readonly environment = new EnvironmentState(context)) {
     this.reloadNotices = new ReloadState(environment);
-    this.networkProxy = new NetworkProxyManager(context, environment);
+    this.networkProxy = new NetworkProxyManager(context, environment, () => this.claudeSessions.networkHomes());
+    this.claudeSessions = new ClaudeSessionController(context, environment, home => this.networkProxy.prepareClaudeHome(home), async root => { const previous = this.claudeOperationLog.directory; await this.claudeOperationLog.move(join(root, 'environments', environment.id, 'logs')); return () => this.claudeOperationLog.move(previous); });
     const root = environment.get<string>('vscodemodelswitch.codexIdentityStorage');
     const defaultLogs = root ? join(root, 'environments', environment.id, 'logs') : join(context.globalStorageUri.fsPath, 'environments', environment.id, 'logs');
     this.operationLog = new OperationLog(environment.get<string>('operationLogDirectory', defaultLogs), environment.id,
-      context.extension?.packageJSON?.version ?? '0.10.0', directory => environment.update('operationLogDirectory', directory));
+      context.extension?.packageJSON?.version ?? '0.12.0', directory => environment.update('operationLogDirectory', directory));
+    const claudeRoot = environment.get<string>('vscodemodelswitch.claudeIdentityStorage');
+    const claudeLogs = claudeRoot ? join(claudeRoot, 'environments', environment.id, 'logs') : join(context.globalStorageUri.fsPath, 'claude', 'environments', environment.id, 'logs');
+    this.claudeOperationLog = new OperationLog(environment.get<string>('claudeOperationLogDirectory', claudeLogs), environment.id, context.extension?.packageJSON?.version ?? '0.12.0', directory => environment.update('claudeOperationLogDirectory', directory));
     this.logReady = environment.ready;
     // A transient startup disk error must not permanently reject every later
     // logging attempt. Each operation retries the write and reports its error.
@@ -117,14 +139,16 @@ export class VSModelSwitchApp implements vscode.Disposable {
       const previous = this.operationLog.directory;
       await this.moveLogs(join(root, 'environments', environment.id, 'logs'));
       return () => this.moveLogs(previous);
-    });
+    }, async (home, sqlite) => rebuildNativeIndex(await this.codexSpeedExecutable(), home, sqlite, this.networkProxy.environment('codex')));
     this.codexAdapter = new CodexAdapter(() => this.sessionController.recoveryDirectory());
     this.speedStore = new SpeedStore(resolveHomePath('.vscodemodelswitch', 'speed'));
     this.outputChannel = vscode.window.createOutputChannel('VSCodeModelSwitch', { log: true });
     this.proxyServer = new ProxyServer(() => { if (!this.disposed) this.refreshStatus(); }, message => { if (!this.disposed) this.outputChannel.info(message); });
     this.store = new ProviderStore(context, environment);
     this.codexOrganization = new ProviderOrganizationStore('codex', context.globalState, environment, () => this.store.getProviders());
-    this.codexGroups = new CodexOrganizationController(this.codexOrganization, () => this.runtimeState.codex.mode === 'api' ? this.runtimeState.codex.matchedProviderId ?? this.store.getCurrentProviderId('codex') : undefined);
+    this.codexGroups = new ProviderOrganizationController(this.codexOrganization, () => this.runtimeState.codex.mode === 'api' ? this.runtimeState.codex.matchedProviderId ?? this.store.getCurrentProviderId('codex') : undefined);
+    this.claudeOrganization = new ProviderOrganizationStore('claude', context.globalState, environment, () => this.store.getProviders());
+    this.claudeGroups = new ProviderOrganizationController(this.claudeOrganization, () => this.runtimeState.claude.mode === 'api' ? this.runtimeState.claude.matchedProviderId : undefined);
     for (const [id, revision] of Object.entries(environment.get<Record<string, string>>('vscodemodelswitch.appliedRevisions', {}))) this.appliedRevisions.set(id, revision);
     this.secretStore = new SecretStore(context.secrets);
     this.modelResolver = new ModelResolver(this.store);
@@ -151,6 +175,8 @@ export class VSModelSwitchApp implements vscode.Disposable {
 
   dispose(): void {
     this.disposed = true;
+    this.claudeHistoryWatcher?.dispose(); if (this.claudeHistoryTimer) clearTimeout(this.claudeHistoryTimer);
+    this.historyWatcher?.dispose(); if (this.historyRefreshTimer) clearTimeout(this.historyRefreshTimer);
     this.speedController?.abort();
     this.networkProxy.dispose();
     disposeNetworkTransport();
@@ -207,13 +233,21 @@ export class VSModelSwitchApp implements vscode.Disposable {
     ]);
     const codexMode = this.runtimeState.codex.mode ?? 'unknown';
 
-    const organization = this.codexOrganization.view();
-    for (const provider of providers) if (provider.tool === 'codex') {
+    for (const provider of providers) {
+      const organization = this.organization(provider.tool).view();
       provider.groupId = organization.memberships[provider.id] ?? INDEPENDENT_GROUP;
       provider.disabled = organization.disabledProviders.includes(provider.id);
       provider.groupDisabled = organization.disabledGroups.includes(provider.groupId);
     }
     const sessions = await this.sessionController.state();
+    const claudeSessions = await this.claudeSessions.state();
+    for (const [tool, state] of [['codex', sessions], ['claude', claudeSessions]] as const) {
+      const profile = state.identities.find(i => i.id === state.activeId);
+      if (state.root && profile) try {
+        const entries = (await new HistoryImports(state.root, tool, profile, this.environment.id, '').read()).entries;
+        state.nativeHistory = { ...state.nativeHistory, importedCount: entries.filter(e => e.visible && (tool === 'codex' || (vscode.workspace.workspaceFolders ?? []).some(f => f.uri.fsPath === e.workspace))).length };
+      } catch { state.nativeHistory = { ...state.nativeHistory, error: '历史显示记录不可读，请检查共享档案权限。' }; }
+    }
     const speedReports = await this.speedStore.readAll();
     for (const provider of providers) {
       const saved = this.store.getProvider(provider.id);
@@ -223,11 +257,15 @@ export class VSModelSwitchApp implements vscode.Disposable {
     const officialTarget = this.currentSpeedTargets().codex;
     return {
       codexOrganization: this.codexOrganization.view(),
+      claudeOrganization: this.claudeOrganization.view(),
+      claudeSessions,
+      claudeMode: this.runtimeState.claude.mode ?? 'unknown',
       networkPresets: this.environment.get('networkPresets', { codex: [], claude: [] }),
       reloadNotices: this.reloadNotices.entries(),
       networkProxy: this.networkProxy.state(),
       sessions,
       logDirectory: this.operationLog.directory,
+      logDirectories: { codex: this.operationLog.directory, claude: this.claudeOperationLog.directory },
       providers,
       lastBatch: this.lastBatch,
       officialInfo: this.officialInfo,
@@ -261,12 +299,14 @@ export class VSModelSwitchApp implements vscode.Disposable {
     const savedLogs = this.environment.get<string>('operationLogDirectory');
     if (savedLogs) await this.moveLogs(savedLogs);
     await this.sessionController.refresh();
+    await this.claudeSessions.refresh();
     await this.networkProxy.refresh();
     await this.initializeCurrentProviders();
   }
 
   async applyNetworkProxyFromSidebar(config: NetworkProxyConfig, tool?: ToolId): Promise<void> {
     tool ??= 'codex';
+    if (tool === 'claude') this.claudeSessions.assertReady();
     if (tool === 'claude' && !await confirmClientChange('Claude Code', '应用网络设置')) throw new Error('已取消：网络设置未更改。');
     if (this.speedController) throw new Error('请先完成或取消生成测速，再更改网络设置。');
     if ((tool ?? 'codex') === 'codex' && !await this.sessionController.confirmChange('应用 Codex 网络设置')) throw new Error('已取消，网络设置未更改。');
@@ -279,6 +319,7 @@ export class VSModelSwitchApp implements vscode.Disposable {
 
   async restoreNetworkProxyFromSidebar(tool?: ToolId): Promise<void> {
     tool ??= 'codex';
+    if (tool === 'claude') this.claudeSessions.assertReady();
     if (tool === 'claude' && !await confirmClientChange('Claude Code', '恢复网络设置')) throw new Error('已取消：网络设置未更改。');
     if (this.speedController) throw new Error('请先完成或取消生成测速，再更改网络设置。');
     if ((tool ?? 'codex') === 'codex' && !await this.sessionController.confirmChange('恢复 Codex 网络设置')) throw new Error('已取消，网络设置未更改。');
@@ -306,47 +347,172 @@ export class VSModelSwitchApp implements vscode.Disposable {
     this.refreshStatus();
   }
 
-  async organizationActionFromSidebar(input: OrganizationAction): Promise<Record<string, unknown>> {
-    this.ensureToolEnabled('codex');
-    const session = await this.sessionController.state();
+  async organizationActionFromSidebar(input: OrganizationAction, tool: ToolId = 'codex'): Promise<Record<string, unknown>> {
+    this.ensureToolEnabled(tool);
+    const session = await (tool === 'codex' ? this.sessionController : this.claudeSessions).state();
     const active = session.identities.find(i => i.id === session.activeId);
-    if (session.restartRequired || (active?.kind ?? this.runtimeState.codex.mode) !== 'api') throw new Error('请先启用 API 模式并重载，再管理 API 群组。');
+    if (session.restartRequired || (active?.kind ?? this.runtimeState[tool].mode) !== 'api') throw new Error('请先启用 API 模式并重载，再管理 API 群组。');
+    const organization = this.organization(tool);
     let result: Record<string, unknown>;
     if (input.action === 'providerTemplate') {
-      this.codexOrganization.assertEnabled(input.providerId!);
-      const group = this.codexOrganization.requireGroup(this.codexOrganization.groupOf(input.providerId!));
-      if (!group.defaults) throw new Error('该群组尚未保存请求处理模板。');
+      organization.requireProvider(input.providerId!); organization.assertEnabled(input.providerId!);
+      const group = organization.requireGroup(organization.groupOf(input.providerId!));
+      if (!group.defaults) throw new Error('该群组尚未保存群组设置。');
       const editor = await this.getProviderConfigFromSidebar(input.providerId!);
-      if (group.defaults.baseUrl) editor.text = setSectionValue(editor.text, 'model_providers.OpenAI', 'base_url', group.defaults.baseUrl);
-      if (group.defaults.proxy) editor.proxy = group.defaults.proxy;
-      result = { editor };
-    } else if (input.action === 'networkDraft') {
-      this.codexOrganization.requireGroup(input.groupId!);
-      if (this.codexOrganization.localState().disabledGroups.includes(input.groupId!)) throw new Error('群组已禁用。');
-      const name = this.codexOrganization.localState().groupNetworkPresets[input.groupId!];
-      const presets = this.environment.get<Partial<Record<ToolId, Array<NetworkProxyConfig & { name: string }>>>>('networkPresets', {});
-      const preset = presets.codex?.find(p => p.name === name);
-      if (!preset) throw new Error('本环境没有该网络预设，请先保存网络预设并在群组设置中选择。');
-      result = { networkDraft: { ...preset, claude: false, codex: true } };
-    } else {
-      if (input.action === 'saveGroup' && input.networkPresetName) {
-        const presets = this.environment.get<Partial<Record<ToolId, Array<{ name: string }>>>>('networkPresets', {});
-        if (!presets.codex?.some(p => p.name === input.networkPresetName)) throw new Error('所选本环境网络预设不存在，请刷新后重试。');
+      if (group.defaults.baseUrl) {
+        if (tool === 'codex') editor.text = setSectionValue(editor.text, 'model_providers.OpenAI', 'base_url', group.defaults.baseUrl);
+        else { const config = JSON.parse(editor.text); config.env = { ...config.env, ANTHROPIC_BASE_URL: group.defaults.baseUrl }; editor.text = JSON.stringify(config, null, 2); }
       }
-      result = await this.codexGroups.execute(input);
+      if (group.defaults.proxy) editor.proxy = group.defaults.proxy;
+      if (group.defaults.usageQuery) editor.usageQuery = { ...groupUsageSettings(group.defaults.usageQuery), userId: editor.usageQuery.userId };
+      result = { editor: { ...editor, groupSettingsLoaded: true } };
+    } else {
+      result = await (tool === 'codex' ? this.codexGroups : this.claudeGroups).execute(input);
     }
     this.refreshStatus(); return result;
   }
 
-  async sessionActionFromSidebar(action: SessionAction, id?: string, file?: string): Promise<void> {
+  async sessionActionFromSidebar(action: SessionAction, id?: string, file?: string, tool: ToolId = 'codex'): Promise<void> {
     if (this.speedController) throw new Error('请先完成生成测速，再管理账号档案。');
-    if (action === 'exportProviders') { await this.exportCodexProviders(); return; }
-    if (action === 'manageBackups' || action === 'deleteHistoryBackups') { await this.manageHistoryBackups(action === 'deleteHistoryBackups'); return; }
-    if (action === 'openFolder') { const root = (await this.sessionController.state()).root; if (!root || !await browseFiles(root, '浏览数据文件')) throw new Error('已取消：未打开数据文件。'); return; }
-    if (action === 'help') { const root = (await this.sessionController.state()).root; if (!root) throw new Error('请先连接数据目录。'); await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.file(join(root, 'readme.md')))); return; }
-    await this.sessionController.action(action, id, file, this.runtimeState.codex.mode === 'api' ? 'api' : 'official');
-    if (action === 'configure' || action === 'switch') await this.reloadNotices.add('codex', action === 'configure' ? 'storage' : 'mode', '当前历史或账号绑定已改变', true);
+    if (action === 'selectHistoryProject' || action === 'clearHistoryProject' || action === 'labelHistoryProject') {
+      await this.chooseHistoryScope(tool, action); this.refreshStatus(); return;
+    }
+    if (action === 'openNativeHistory') {
+      const sessions = tool === 'codex' ? this.sessionController : this.claudeSessions;
+      sessions.assertReady();
+      const state = await sessions.state();
+      if (tool === 'codex' && state.nativeHistory?.index === 'legacy') { await this.sessionController.action('refreshHistory'); await this.reloadNotices.add(tool, 'storage', '原生历史索引已升级，请重载', true); this.refreshStatus(); return; }
+      const manager = await this.historyImports(tool, state, false);
+      if (manager && (await manager.selected()).length) { await this.openImportedHistory(tool, state, manager); return; }
+      const command = tool === 'codex' ? 'chatgpt.openSidebar' : 'claude-vscode.sidebar.open';
+      if (!(await vscode.commands.getCommands(true)).includes(command)) throw new Error('请先在当前环境安装并启用对应的官方扩展。');
+      await vscode.commands.executeCommand(command); return;
+    }
+    if (action === 'exportProviders') { await this.exportCodexProviders(tool); return; }
+    if (action === 'manageBackups' || action === 'deleteHistoryBackups') { await this.manageHistoryBackups(action === 'deleteHistoryBackups', tool); return; }
+    if (action === 'openFolder') { const root = (await (tool === 'codex' ? this.sessionController : this.claudeSessions).state()).root; if (!root || !await browseFiles(root, '浏览数据文件')) throw new Error('已取消：未打开数据文件。'); return; }
+    if (action === 'help') { const root = (await (tool === 'codex' ? this.sessionController : this.claudeSessions).state()).root; if (!root) throw new Error('请先连接数据目录。'); await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(vscode.Uri.file(join(root, 'readme.md')))); return; }
+    if (tool === 'claude') await this.claudeSessions.action(action, id, this.runtimeState.claude.mode === 'api' ? 'api' : 'official');
+    else await this.sessionController.action(action, id, file, this.runtimeState.codex.mode === 'api' ? 'api' : 'official');
+    if (action === 'configure' || action === 'switch' || action === 'refreshHistory') await this.reloadNotices.add(tool, action === 'switch' ? 'mode' : 'storage', '当前历史或账号绑定已改变', true);
+    await this.watchSharedHistory();
     this.refreshStatus();
+  }
+
+  private async historyImports(tool: ToolId, state: SessionState, choose: boolean): Promise<HistoryImports | undefined> {
+    const profile = state.identities.find(i => i.id === state.activeId);
+    if (!state.root || !profile || !state.attached) throw new Error('请先连接当前账号历史。');
+    const folders = vscode.workspace.workspaceFolders?.filter(f => f.uri.scheme === 'file') ?? [];
+    if (!folders.length) throw new Error('请先打开本地项目文件夹。');
+    const remembered = this.environment.get<string>('historyWorkspace.' + tool + '.' + profile.id, '');
+    const picked = choose && folders.length > 1 ? (await vscode.window.showQuickPick(folders.map(f => ({ label: f.name, description: f.uri.fsPath, folder: f })), { title: '选择当前工作区（新聊天保存位置不变）' }))?.folder : folders.find(f => f.uri.fsPath === remembered) ?? folders[0];
+    if (!picked) return;
+    if (choose) await this.environment.update('historyWorkspace.' + tool + '.' + profile.id, picked.uri.fsPath);
+    return new HistoryImports(state.root, tool, profile, this.environment.id, await fs.realpath(picked.uri.fsPath));
+  }
+  private async assertHistoryContext(tool: ToolId, state: SessionState): Promise<void> {
+    const controller = tool === 'codex' ? this.sessionController : this.claudeSessions;
+    controller.assertReady(); const latest = await controller.state();
+    if (!latest.attached || latest.activeId !== state.activeId || latest.root !== state.root) throw new Error('账号或数据目录已改变，请重新选择历史。');
+  }
+  private async historyNativeChange(state: SessionState, changes: { remove?: string[]; names?: Record<string, string> }): Promise<void> {
+    await rebuildNativeIndex(await this.codexSpeedExecutable(), state.runtimeHome, join(state.root!, 'environments', state.environmentId, 'indexes', state.activeId!), this.networkProxy.environment('codex'), undefined, changes);
+  }
+  private async chooseHistoryScope(tool: ToolId, action: 'selectHistoryProject' | 'clearHistoryProject' | 'labelHistoryProject'): Promise<void> {
+    const controller = tool === 'codex' ? this.sessionController : this.claudeSessions;
+    controller.assertReady(); const state = await controller.state();
+    if (action === 'labelHistoryProject') {
+      const target = state.identities.find(p => p.id === state.activeId);
+      if (!state.root || !target || !state.attached) throw new Error('请先连接历史数据目录。');
+      const workspace = vscode.workspace.workspaceFolders?.find(f => f.uri.scheme === 'file')?.uri.fsPath || '';
+      const manager = new HistoryImports(state.root, tool, target, this.environment.id, workspace);
+      const listing = await manager.list(state.identities, this.environment.label), labels = new HistoryLabels(state.root);
+      const providers = this.store?.getProvidersByTool(tool).filter(p => p.codexMode !== 'official').map(p => p.name) ?? [];
+      let model = await labels.model(state.identities, listing.sessions, providers, listing.problems);
+      await manageHistoryLabels(tool === 'codex' ? 'Codex' : 'Claude Code', model, async (revision, draft) => {
+        await this.assertHistoryContext(tool, state);
+        await labels.save(revision, draft, model);
+        const latest = await manager.list(state.identities, this.environment.label);
+        model = await labels.model(state.identities, latest.sessions, providers, latest.problems); return model;
+      }); return;
+    }
+    if (tool === 'codex' && state.nativeHistory?.index !== 'ready') {
+      await this.sessionController.action('refreshHistory');
+      await this.reloadNotices.add(tool, 'storage', '原生历史索引已升级，请重载后管理历史', true); return;
+    }
+    const manager = await this.historyImports(tool, state, true); if (!manager) return;
+    // Old directory/hard-link browsing must be explicitly detached first; no
+    // new multi-selection ever adds a source-writable hard link.
+    if (tool === 'claude' && (state.nativeHistory?.legacyMapping || state.nativeHistory?.owned)) {
+      if (action !== 'clearHistoryProject') throw new Error('检测到旧版项目映射，请先在“管理已显示历史”解除旧入口并重载，再使用新版多选。');
+      await this.claudeSessions.setHistoryProject(manager.workspace);
+      await this.reloadNotices.add(tool, 'storage', '旧版浏览入口已解除，请重载后添加历史', true); return;
+    }
+    if (action === 'clearHistoryProject') {
+      const entries = await manager.selected();
+      const keys = await pickHistoryTree(tool === 'codex' ? 'Codex' : 'Claude Code', await new HistoryLabels(state.root!).importedRows(state.identities, entries, (await manager.list(state.identities, this.environment.label)).sessions), 'remove');
+      if (!keys?.length) return;
+      await this.assertHistoryContext(tool, state);
+      if (!await confirmClientChange(tool, '移除所选历史的展示入口（来源与续聊副本保留）')) return;
+      const result = await manager.remove(keys, tool === 'codex' ? changes => this.historyNativeChange(state, changes) : undefined);
+      if (result.removed) await this.reloadNotices.add(tool, 'storage', '已移除 ' + result.removed + ' 条历史展示，请重载', true);
+      await this.historyOperationReport(result.removed, '移除展示', result.problems); return;
+    }
+    const listing = await manager.list(state.identities, this.environment.label);
+    const keys = await pickHistoryTree(tool === 'codex' ? 'Codex' : 'Claude Code', await new HistoryLabels(state.root!).candidateRows(state.identities, listing.sessions), 'add', listing.problems);
+    if (!keys?.length) return;
+    await this.assertHistoryContext(tool, state);
+    if (!await confirmClientChange(tool, '增量添加所选历史的独立副本（续聊使用当前帐号，来源记录不变）')) return;
+    const provider = tool === 'codex' ? getTopLevelStringValue(await fs.readFile(join(state.runtimeHome, 'config.toml'), 'utf8'), 'model_provider') || 'openai' : '';
+    const result = await manager.add(listing.sessions.filter(s => keys.includes(s.key) && !s.present), state.identities, tool === 'codex' ? changes => this.historyNativeChange(state, changes) : undefined, provider);
+    if (result.added) await this.reloadNotices.add(tool, 'storage', '已添加 ' + result.added + ' 条独立历史副本，请重载', true);
+    await this.historyOperationReport(result.added, '添加历史', result.problems);
+  }
+  private async historyOperationReport(count: number, action: string, problems: string[]): Promise<void> {
+    if (problems.length) await vscode.window.showWarningMessage(action + '完成 ' + count + ' 条；部分未完成：' + problems.join('；'));
+    else await vscode.window.showInformationMessage(action + '完成 ' + count + ' 条。');
+  }
+  private async openImportedHistory(tool: ToolId, state: SessionState, manager: HistoryImports): Promise<void> {
+    const chosen = await vscode.window.showQuickPick((await manager.selected()).map(entry => ({ label: sourceTitle(entry), description: entry.cwd, entry })), { title: '在原生扩展打开已添加历史（续聊保存到当前档案副本）', matchOnDescription: true });
+    if (!chosen) return;
+    await this.assertHistoryContext(tool, state);
+    if (tool === 'codex') {
+      await rebuildNativeIndex(await this.codexSpeedExecutable(), state.runtimeHome, join(state.root!, 'environments', state.environmentId, 'indexes', state.activeId!), this.networkProxy.environment('codex'), chosen.entry.nativeId);
+      if (!(await vscode.commands.getCommands(true)).includes('chatgpt.openSidebar')) throw new Error('请先启用Codex官方扩展。');
+      await vscode.commands.executeCommand('chatgpt.openSidebar');
+      if (!await vscode.env.openExternal(vscode.Uri.parse((vscode.env.uriScheme || 'vscode') + '://openai.chatgpt/local/' + chosen.entry.nativeId))) throw new Error('原生会话打开失败。');
+    } else {
+      if (!(await vscode.commands.getCommands(true)).includes('claude-vscode.primaryEditor.open')) throw new Error('请先启用Claude官方扩展。');
+      await vscode.commands.executeCommand('claude-vscode.primaryEditor.open', chosen.entry.nativeId);
+    }
+  }
+
+  private async watchSharedHistory(): Promise<void> {
+    const states = await Promise.all([this.sessionController.state(), this.claudeSessions.state()]);
+    for (const [tool, state] of [['codex', states[0]], ['claude', states[1]]] as const) {
+      const root = state.root, previous = tool === 'codex' ? this.historyWatchRoot : this.claudeHistoryWatchRoot;
+      if (root === previous) continue;
+      if (tool === 'codex') { this.historyWatcher?.dispose(); if (this.historyRefreshTimer) clearTimeout(this.historyRefreshTimer); this.historyWatchRoot = root; }
+      else { this.claudeHistoryWatcher?.dispose(); if (this.claudeHistoryTimer) clearTimeout(this.claudeHistoryTimer); this.claudeHistoryWatchRoot = root; }
+      if (!root) continue;
+      const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(root, tool === 'codex' ? 'profiles/*/history/{session_index.jsonl,sessions/**,archived_sessions/**}' : 'profiles/*/history/projects/**'));
+      if (tool === 'codex') this.historyWatcher = watcher; else this.claudeHistoryWatcher = watcher;
+      const refresh = () => {
+        const timer = tool === 'codex' ? this.historyRefreshTimer : this.claudeHistoryTimer;
+        if (timer) clearTimeout(timer);
+        const next = setTimeout(() => {
+          if (this.disposed) return;
+          void maintainOwnedHistory(root, tool).then(async result => {
+            if (result.blocked) this.outputChannel.warn(tool + ' shared history requires its writing environment to repair some file permissions.');
+            if (tool === 'codex') await this.sessionController.refreshHistoryIndex();
+            this.refreshStatus();
+          }).catch(() => this.outputChannel.warn(tool + ' shared history permission/index refresh unavailable.'));
+        }, 500);
+        if (tool === 'codex') this.historyRefreshTimer = next; else this.claudeHistoryTimer = next;
+      };
+      watcher.onDidCreate(refresh); watcher.onDidChange(refresh); watcher.onDidDelete(refresh);
+      await maintainOwnedHistory(root, tool).catch(() => this.outputChannel.warn(tool + ' shared history permission maintenance unavailable.'));
+    }
   }
 
   private async refreshNetworkDiagnostics(): Promise<void> {
@@ -357,6 +523,7 @@ export class VSModelSwitchApp implements vscode.Disposable {
   }
 
   async setToolEnabledFromSidebar(tool: ToolId, enabled: boolean): Promise<void> {
+    if (tool === 'claude' && enabled !== this.store.getToolEnabled(tool) && !await confirmClientChange('Claude Code', enabled ? '启用配置管理' : '停用配置管理')) throw new Error('已取消：启用状态未更改。');
     if (tool === 'codex' && enabled !== this.store.getToolEnabled(tool) && !await this.sessionController.confirmChange(enabled ? '启用 Codex 配置管理' : '停用 Codex 配置管理')) throw new Error('已取消：启用状态未更改。');
     await this.store.setToolEnabled(tool, enabled);
     this.refreshStatus();
@@ -399,7 +566,7 @@ export class VSModelSwitchApp implements vscode.Disposable {
   async testToolNetworkFromSidebar(tool: ToolId): Promise<void> {
     this.ensureToolEnabled(tool);
     let selectedIds: Set<string> | undefined; let includeGeneration = false;
-    if (tool === 'codex') {
+    {
       const choices = this.store.getProvidersByTool(tool).filter(p => p.codexMode !== 'official' && this.providerIsEnabled(p)).map(p => ({ label: p.name, description: p.baseUrl, id: p.id, picked: true }));
       const selected = await vscode.window.showQuickPick(choices, { title: '选择要诊断的供应商', canPickMany: true });
       if (!selected?.length) throw new Error('已取消：未选择供应商。');
@@ -556,9 +723,18 @@ export class VSModelSwitchApp implements vscode.Disposable {
 
   async applyProviderFromSidebar(providerId: string): Promise<void> {
     const provider = this.store.getProvider(providerId); if (!provider) throw new Error('未找到供应商。');
-    const previousMode = this.runtimeState.codex.mode;
+    const previousMode = this.runtimeState[provider.tool].mode;
     this.ensureProviderEnabled(provider); await this.activateProvider(provider);
-    if (provider.tool === 'codex') await this.reloadNotices.add('codex', previousMode === 'api' ? 'providers' : 'mode', previousMode === 'api' ? '供应商配置已写入；已有对话可能需要重新打开' : '登录方式已改变，请重新加载窗口', previousMode !== 'api');
+    await this.reloadNotices.add(provider.tool, previousMode === 'api' ? 'providers' : 'mode', previousMode === 'api' ? '供应商配置已写入；已有对话可能需要重新打开' : '登录方式已改变，请重新加载窗口', previousMode !== 'api');
+    this.refreshStatus();
+  }
+
+  async applyClaudeModeFromSidebar(mode: CodexMode): Promise<void> {
+    this.ensureToolEnabled('claude');
+    await this.claudeSessions.prepareMode(mode, this.runtimeState.claude.mode === 'api' ? 'api' : 'official');
+    await this.reloadNotices.add('claude', 'mode', 'Claude 账号或模式已改变，请重载扩展并重启已有 CLI', true);
+    // Old terminal credentials are never passed to a newly selected official home.
+    for (const name of Object.keys(this.lastEnv)) if (name.startsWith('ANTHROPIC_') || name === 'ENABLE_TOOL_SEARCH') delete this.lastEnv[name];
     this.refreshStatus();
   }
 
@@ -827,8 +1003,8 @@ export class VSModelSwitchApp implements vscode.Disposable {
     const provider = this.store.getProvider(providerId), target = this.store.getProvider(beforeProviderId);
     if (!provider || !target || provider.tool !== target.tool) throw new Error('供应商必须属于同一客户端。');
     this.ensureToolEnabled(provider.tool);
-    if (provider.tool === 'codex') await this.codexOrganization.moveProvider(providerId, this.codexOrganization.groupOf(beforeProviderId), beforeProviderId);
-    else await this.store.moveProvider(providerId, beforeProviderId);
+    await this.organization(provider.tool).moveProvider(providerId, this.organization(provider.tool).groupOf(beforeProviderId), beforeProviderId);
+
     this.refreshStatus();
   }
 
@@ -844,10 +1020,11 @@ export class VSModelSwitchApp implements vscode.Disposable {
     await deleteBackups(path);
   }
 
-  private providerIsEnabled(provider: ProviderProfile): boolean { return provider.tool !== 'codex' || !this.codexOrganization || this.codexOrganization.isEnabled(provider.id); }
+  private organization(tool: ToolId): ProviderOrganizationStore { return tool === 'codex' ? this.codexOrganization : this.claudeOrganization; }
+  private providerIsEnabled(provider: ProviderProfile): boolean { return !this.organization(provider.tool) || this.organization(provider.tool).isEnabled(provider.id); }
   private ensureProviderEnabled(provider: ProviderProfile): void {
     this.ensureToolEnabled(provider.tool);
-    if (provider.tool === 'codex') this.codexOrganization?.assertEnabled(provider.id);
+    this.organization(provider.tool)?.assertEnabled(provider.id);
   }
 
   private async validateProviderUniqueness(
@@ -857,12 +1034,13 @@ export class VSModelSwitchApp implements vscode.Disposable {
     key: string,
     excludedProviderId?: string
   ): Promise<void> {
+    const providers = this.store.getProviders();
+    if (providers.some(provider => provider.id !== excludedProviderId && provider.tool === tool && normalizeProviderName(provider.name) === normalizeProviderName(name))) {
+      throw new Error('当前客户端已存在同名供应商，请使用其他名称（跨群组也不能重名）。');
+    }
     let keyAlreadySaved = false;
-    for (const provider of this.store.getProviders()) {
+    for (const provider of providers) {
       if (provider.id === excludedProviderId) continue;
-      if (provider.tool === tool && normalizeProviderName(provider.name) === normalizeProviderName(name)) {
-        throw new Error('已存在同名供应商。');
-      }
       const existingKey = await this.secretStore.get(provider.secretRef);
       if (existingKey !== key) continue;
       keyAlreadySaved = true;
@@ -914,15 +1092,17 @@ export class VSModelSwitchApp implements vscode.Disposable {
     await this.importPublicConfig(tool);
   }
 
-  async clearLogFromSidebar(): Promise<boolean> {
+  async clearLogFromSidebar(tool: ToolId = 'codex'): Promise<boolean> {
+    const log = tool === 'claude' ? this.claudeOperationLog : this.operationLog;
     const confirmation = await vscode.window.showWarningMessage(
-      '删除当前环境的插件操作日志及本窗口输出日志？不会删除配置、账号、聊天、备份或恢复材料。日志目录：' + this.operationLog.directory,
+      (tool === 'claude' ? '删除当前环境的 Claude 操作日志？' : '删除当前环境的 Codex 操作日志及本窗口输出日志？') + '不会删除配置、账号、聊天、备份或恢复材料。日志目录：' + log.directory,
       { modal: true },
       { title: '删除日志' }, { title: '取消', isCloseAffordance: true }
     );
     if (confirmation?.title !== '删除日志') return false;
     await this.logReady;
-    await this.operationLog.clear();
+    await log.clear();
+    if (tool === 'claude') return true; // The VS Code output channel belongs to the whole extension.
     this.outputChannel.dispose();
     try {
       const entries = await fs.readdir(this.context.logUri.fsPath, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => { if (error.code !== 'ENOENT') throw error; return []; });
@@ -938,7 +1118,7 @@ export class VSModelSwitchApp implements vscode.Disposable {
 
   async recordOperation(event: OperationEvent): Promise<void> {
     await this.logReady;
-    await this.operationLog.write(event);
+    await (event.target?.startsWith('claude:') ? this.claudeOperationLog : this.operationLog).write(event);
   }
 
   private async moveLogs(directory: string): Promise<void> {
@@ -955,18 +1135,19 @@ export class VSModelSwitchApp implements vscode.Disposable {
     }
   }
 
-  async logActionFromSidebar(action: 'view' | 'folder' | 'export'): Promise<void> {
+  async logActionFromSidebar(action: 'view' | 'folder' | 'export', tool: ToolId = 'codex'): Promise<void> {
+    const log = tool === 'claude' ? this.claudeOperationLog : this.operationLog;
     await this.logReady;
     if (action === 'folder') {
-      await fs.mkdir(this.operationLog.directory, { recursive: true, mode: 0o700 });
-      if (!await browseFiles(this.operationLog.directory, '浏览操作日志', /[.](?:log|jsonl)$/i)) throw new Error('已取消：未打开日志。');
+      await fs.mkdir(log.directory, { recursive: true, mode: 0o700 });
+      if (!await browseFiles(log.directory, '浏览操作日志', /[.](?:log|jsonl)$/i)) throw new Error('已取消：未打开日志。');
     } else if (action === 'view') {
-      const document = await vscode.workspace.openTextDocument({ content: await this.operationLog.text(), language: 'jsonl' });
+      const document = await vscode.workspace.openTextDocument({ content: await log.text(), language: 'jsonl' });
       await vscode.window.showTextDocument(document, { preview: false });
     } else {
       const uri = await vscode.window.showSaveDialog({ title: '导出操作诊断日志（不含聊天或认证）', filters: { JSONL: ['jsonl'] }, saveLabel: '导出' });
       if (!uri) throw new Error('已取消：未导出日志。');
-      await fs.writeFile(uri.fsPath, await this.operationLog.text(), { mode: 0o600 });
+      await fs.writeFile(uri.fsPath, await log.text(), { mode: 0o600 });
     }
   }
 
@@ -978,6 +1159,8 @@ export class VSModelSwitchApp implements vscode.Disposable {
   private async initializeCurrentProviders(): Promise<void> {
     await this.environment.ready;
     await this.sessionController.ready;
+    await this.watchSharedHistory();
+    await this.claudeSessions.ready;
     await this.networkProxy.ready;
     if (!this.restoreAttempted) {
       try { const recovered = await this.codexAdapter.recoverPending(); if (recovered) void vscode.window.showInformationMessage(recovered); }
@@ -990,8 +1173,8 @@ export class VSModelSwitchApp implements vscode.Disposable {
     }
     await this.scanCurrentProvidersFromConfig();
     if (firstInitialization) {
-      const session = await this.sessionController.state();
-      await this.reloadNotices.acknowledgeStartup(notice => notice.section === 'network' ? !this.networkProxy.state().tools?.[notice.tool]?.error : !this.sessionController.recoveryBlocked && (!session.root || session.attached) && this.runtimeState.codex.mode !== 'unknown');
+      const session = await this.sessionController.state(), claudeSession = await this.claudeSessions.state();
+      await this.reloadNotices.acknowledgeStartup(notice => notice.section === 'network' ? !this.networkProxy.state().tools?.[notice.tool]?.error : notice.tool === 'claude' ? (!claudeSession.root || claudeSession.attached) : !this.sessionController.recoveryBlocked && (!session.root || session.attached) && this.runtimeState.codex.mode !== 'unknown');
       for (const provider of Object.values(this.store.getCurrentProviders())) {
         if (provider && !this.appliedRevisions.has(provider.id)) this.appliedRevisions.set(provider.id, provider.updatedAt);
       }
@@ -1006,17 +1189,18 @@ export class VSModelSwitchApp implements vscode.Disposable {
     this.speedStore = new SpeedStore(resolveHomePath('.vscodemodelswitch', 'speed'));
     const providers = this.store.getProviders();
     const [claudeConfig, codexConfig]: [
-      { baseUrl?: string; model?: string; key?: string },
+      { baseUrl?: string; model?: string; key?: string; mode?: CodexMode },
       { baseUrl?: string; model?: string; providerId?: string; key?: string; mode?: CodexMode | 'unknown'; officialLoggedIn?: boolean }
     ] = await Promise.all([
-      this.claudeAdapter.readActiveConfig().catch(() => ({})),
+      this.claudeSessions.recoveryBlocked ? Promise.resolve({}) : this.claudeAdapter.readActiveConfig().catch(() => ({})),
       this.codexAdapter.readActiveConfig().catch(() => ({}))
     ]);
 
     const localId = managedProxyId(claudeConfig.baseUrl, claudeConfig.key);
     const synced = vscode.workspace.getConfiguration('vscodemodelswitch').get<boolean>('globalCliSync', true);
+    const claudeMode = !synced && this.lastEnv.ANTHROPIC_BASE_URL ? 'api' : claudeConfig.mode ?? 'unknown';
     let claude = !synced ? this.store.getCurrentProvider('claude') : localId ? providers.find(p => p.tool === 'claude' && p.id === localId) : await matchProviderFromConfig(providers, 'claude', claudeConfig.baseUrl, claudeConfig.key, this.secretStore);
-    claude = await this.reconcileObservedProvider('claude', claude, claudeConfig, synced);
+    claude = claudeMode === 'official' ? undefined : await this.reconcileObservedProvider('claude', claude, claudeConfig, synced);
     const effectiveClaude = synced ? claudeConfig : { baseUrl: this.lastEnv.ANTHROPIC_BASE_URL, key: this.lastEnv.ANTHROPIC_AUTH_TOKEN, model: this.lastEnv.ANTHROPIC_MODEL };
     if (claude) {
       await this.store.setCurrentProviderId('claude', claude.id);
@@ -1025,11 +1209,12 @@ export class VSModelSwitchApp implements vscode.Disposable {
     }
     this.runtimeState.claude = {
       tool: 'claude',
-      providerName: claude?.name,
+      mode: claudeMode,
+      providerName: claudeMode === 'official' ? 'Official account' : claude?.name,
       baseUrl: effectiveClaude.baseUrl,
       model: effectiveClaude.model,
       matchedProviderId: claude?.id,
-      status: await this.determineToolStatus('claude', providers, claude, effectiveClaude.baseUrl, effectiveClaude.key),
+      status: !this.store.getToolEnabled('claude') ? 'off' : claudeMode === 'official' ? 'nativeAuth' : await this.determineToolStatus('claude', providers, claude, effectiveClaude.baseUrl, effectiveClaude.key),
       configPath: this.claudeAdapter.getConfigPath()
     };
 
@@ -1219,16 +1404,19 @@ export class VSModelSwitchApp implements vscode.Disposable {
 
   private async createProvider(input: CreateProviderInput): Promise<void> {
     this.ensureToolEnabled(input.tool);
-    if (input.tool === 'codex') {
-      const group = this.codexOrganization.requireGroup(input.groupId ?? INDEPENDENT_GROUP);
-      if (input.applyNow && this.codexOrganization.localState().disabledGroups.includes(group.id)) throw new Error('目标群组已禁用，允许保存新供应商，但不能同时应用。');
+    {
+      const group = this.organization(input.tool).requireGroup(input.groupId ?? INDEPENDENT_GROUP);
+      if (input.applyNow && this.organization(input.tool).localState().disabledGroups.includes(group.id)) throw new Error('目标群组已禁用，允许保存新供应商，但不能同时应用。');
     }
     if (!input.name.trim()) {
       throw new Error('请填写供应商名称。');
     }
     const configMode = input.configMode ?? 'generated';
     const codexMode = input.tool === 'codex' ? (input.codexMode ?? 'api') : undefined;
-    const proxy = normalizeProxyConfig(input.proxy, input.tool);
+    // New Codex providers copy optional group settings exactly once. The
+    // independent group always starts with defaults; no template is required.
+    const groupDefaults = input.groupId && input.groupId !== INDEPENDENT_GROUP ? this.organization(input.tool).requireGroup(input.groupId).defaults : undefined;
+    const proxy = normalizeProxyConfig(groupDefaults?.proxy, input.tool);
     const configText = codexMode === 'official' ? '' : input.configText ?? buildTemplate(input.tool, input.baseUrl.trim(), input.model.trim());
     if (!(input.tool === 'codex' && codexMode === 'official')) validateConfigText(input.tool, configText);
     const values = codexMode === 'official' ? { baseUrl: '', model: '', key: '' } : extractConfigValues(input.tool, configText);
@@ -1236,8 +1424,9 @@ export class VSModelSwitchApp implements vscode.Disposable {
     if (codexMode !== 'official' && !values.baseUrl) throw new Error('请填写 API 地址。');
     if (codexMode !== 'official' && !key) throw new Error('无法识别 API 密钥，请重新填写。');
     if (codexMode !== 'official') await this.validateProviderUniqueness(input.tool, input.name, values.baseUrl, key);
-    const confirmed = input.applyNow && input.tool === 'codex';
-    if (confirmed) {
+    const confirmed = input.applyNow;
+    if (confirmed && input.tool === 'claude') { await this.claudeSessions.ensureMode('api'); if (this.runtimeState.claude.mode === 'official' && !(await this.claudeSessions.state()).root) throw new Error('请先连接数据目录并切换到 API 档案，保留官方登录状态。'); if (!await confirmClientChange('Claude Code', '保存并应用 API 供应商')) throw new Error('已取消：供应商未保存或应用。'); }
+    if (confirmed && input.tool === 'codex') {
       await this.sessionController.ensureMode(codexMode ?? 'api');
       if (!await this.sessionController.confirmChange('保存并应用 Codex API Provider')) throw new Error('已取消：Provider 未保存或应用。');
     }
@@ -1256,6 +1445,7 @@ export class VSModelSwitchApp implements vscode.Disposable {
       secretRef,
       configMode,
       configText: redactConfigText(input.tool, configText),
+      ...(groupDefaults?.usageQuery ? { usageQuery: groupUsageSettings(groupDefaults.usageQuery) } : {}),
       proxy,
       codexMode,
       createdAt: now,
@@ -1270,8 +1460,8 @@ export class VSModelSwitchApp implements vscode.Disposable {
     }
 
     await this.store.upsertProvider(provider);
-    if (input.tool === 'codex' && codexMode !== 'official') {
-      try { await this.codexOrganization.assignNewProvider(provider.id, input.groupId); }
+    if (codexMode !== 'official') {
+      try { await this.organization(input.tool).assignNewProvider(provider.id, input.groupId); }
       catch (error) { await this.store.deleteProvider(provider.id); await this.secretStore.delete(secretRef); throw error; }
     }
     if (!values.model && codexMode !== 'official') {
@@ -1351,6 +1541,11 @@ export class VSModelSwitchApp implements vscode.Disposable {
     this.ensureToolEnabled(tool);
     const provider = this.store.getCurrentProvider(tool);
     if (provider) this.ensureProviderEnabled(provider);
+    if (tool === 'claude' && provider) {
+      if (this.runtimeState.claude.mode === 'official' && !(await this.claudeSessions.state()).root) throw new Error('请先连接数据目录并切换到 API 档案；原官方账号的登录状态会保留。');
+      await this.claudeSessions.ensureMode('api');
+      if (!confirmed && !await confirmClientChange('Claude Code', '应用 API 供应商')) throw new Error('已取消：配置未更改。');
+    }
     if (tool === 'codex' && provider) {
       await this.sessionController.ensureMode(provider.codexMode ?? 'api');
       if (!confirmed && !await this.sessionController.confirmChange('应用 Codex API Provider')) throw new Error('已取消，配置未更改。');
@@ -1381,6 +1576,11 @@ export class VSModelSwitchApp implements vscode.Disposable {
       resolved.claude = { providerId: provider.id, providerName: provider.name, ...endpoint!, model: value.model, configText: useProxy ? proxyClientConfig(value.configText, endpoint!, tool) : value.configText, proxy: useProxy };
     } else {
       resolved.codex = { providerId: provider.id, providerName: provider.name, ...endpoint!, model: value.model, codexProviderId: 'OpenAI', wireApi: 'responses', configText: useProxy ? proxyClientConfig(value.configText, endpoint!, tool) : value.configText, mode: provider.codexMode ?? 'api', proxy: useProxy };
+    }
+
+    if (resolved.missingSecrets.length === 0 && provider.codexMode !== 'official') {
+      const state = await (tool === 'codex' ? this.sessionController : this.claudeSessions).state();
+      if (state.root && state.attached && state.identities.some(p => p.id === state.activeId && p.kind === 'api')) resolved.historySource = { root: state.root, profileId: state.activeId!, environmentId: this.environment.id, environment: this.environment.label };
     }
 
     const previousRevisions = this.environment.get<Record<string, string>>('vscodemodelswitch.appliedRevisions', {});
@@ -1437,6 +1637,11 @@ export class VSModelSwitchApp implements vscode.Disposable {
       if (!await this.sessionController.confirmChange('应用 Codex API Provider')) throw new Error('已取消：当前 Provider 未更改。');
       confirmed = true;
     }
+    if (provider.tool === 'claude' && !confirmed) {
+      await this.claudeSessions.ensureMode('api');
+      if (!await confirmClientChange('Claude Code', '应用 API 供应商')) throw new Error('已取消：供应商未更改。');
+      confirmed = true;
+    }
     const previous = this.store.getCurrentProviderId(provider.tool);
     await this.store.setCurrentProviderId(provider.tool, provider.id);
     try {
@@ -1452,7 +1657,7 @@ export class VSModelSwitchApp implements vscode.Disposable {
   private async restoreAppliedProxy(): Promise<void> {
     const synced = vscode.workspace.getConfiguration('vscodemodelswitch').get<boolean>('globalCliSync', true);
     for (const tool of ['claude', 'codex'] as ToolId[]) {
-      if (tool === 'codex' && this.sessionController.recoveryBlocked) continue;
+      if (tool === 'codex' && this.sessionController.recoveryBlocked || tool === 'claude' && this.claudeSessions.recoveryBlocked) continue;
       const recordKey = tool === 'claude' ? 'vscodemodelswitch.appliedProxy' : 'vscodemodelswitch.appliedCodexProxy';
       const record = structuredClone(this.context.workspaceState.get<AppliedProxyRecord>(this.environment.key(recordKey)) ?? this.context.workspaceState.get<AppliedProxyRecord>(recordKey));
       if (!record || (!synced && !this.context.workspaceState.get(this.environment.key(recordKey))) || record.provider.tool !== tool || !this.store.getProvider(record.provider.id)) continue;
@@ -1494,11 +1699,12 @@ export class VSModelSwitchApp implements vscode.Disposable {
     // Resuming/stopping an existing route also affects live client requests.
     // If Apply is needed it owns the confirmation, so this never asks twice.
     if (provider.tool === 'codex' && (action === 'stop' || canResume) && !await this.sessionController.confirmChange('更改当前 API Provider 的协议转换代理')) throw new Error('已取消：代理状态未更改。');
+    if (provider.tool === 'claude' && (action === 'stop' || canResume) && !await confirmClientChange('Claude Code', '更改当前 API 供应商的协议兼容转发')) throw new Error('已取消：转发状态未更改。');
     if (action === 'stop' || action === 'restart') this.proxyServer.stopRoute(providerId);
     if (action === 'start' || action === 'restart') {
       if (!this.proxyServer.resumeRoute(providerId)) {
         if (this.appliedRevisions.has(providerId) && this.appliedRevisions.get(providerId) !== provider.updatedAt) throw new Error('Apply pending changes before starting this proxy');
-        await this.activateProvider(provider, provider.tool === 'codex' && Boolean(canResume));
+        await this.activateProvider(provider, Boolean(canResume));
       }
       delete this.toolFailures[provider.tool];
     }
@@ -1612,8 +1818,9 @@ export class VSModelSwitchApp implements vscode.Disposable {
   }
 
   private async openClaudeTerminal(): Promise<void> {
+    this.claudeSessions.assertReady();
     const env = Object.fromEntries(Object.entries(this.lastEnv).filter(([name]) => !name.startsWith('OPENAI_')));
-    this.terminalManager.openClaude({ ...env, ...this.networkProxy.environment('claude') });
+    this.terminalManager.openClaude({ ...(this.runtimeState.claude.mode === 'api' ? env : {}), CLAUDE_CONFIG_DIR: (await this.claudeSessions.state()).runtimeConfigDir ?? '', ...this.networkProxy.environment('claude') });
   }
 
   private async openCodexTerminal(): Promise<void> {
@@ -1639,10 +1846,10 @@ export class VSModelSwitchApp implements vscode.Disposable {
       await vscode.window.showTextDocument(document, { preview: false });
     }
   }
-  private async manageHistoryBackups(remove: boolean): Promise<void> {
-    const root = (await this.sessionController.state()).root;
+  private async manageHistoryBackups(remove: boolean, tool: ToolId = 'codex'): Promise<void> {
+    const root = (await (tool === 'codex' ? this.sessionController : this.claudeSessions).state()).root;
     if (!root) throw new Error('请先连接数据目录。');
-    const parent = join(root, 'backups'), backups = await historyBackups(parent);
+    const parent = join(root, 'backups'), backups = await historyBackups(parent, tool);
     if (!backups.length) throw new Error('尚无历史备份。');
     const choices = backups.map(backup => ({ label: backup.name, description: backup.createdAt + ' · ' + (backup.bytes / 1048576).toFixed(2) + ' MiB · ' + (backup.complete ? '完整快照' : '未完成'), detail: backup.directory, backup }));
     if (remove) {
@@ -1650,22 +1857,23 @@ export class VSModelSwitchApp implements vscode.Disposable {
       if (!selected?.length) throw new Error('已取消：未删除备份。');
       const answer = await vscode.window.showWarningMessage('删除以下 ' + selected.length + ' 份历史备份？活动聊天历史不变。\n' + selected.map(x => x.label + ' · ' + x.description).join('\n'), { modal: true }, { title: '删除所选备份' }, { title: '取消', isCloseAffordance: true });
       if (answer?.title !== '删除所选备份') throw new Error('已取消：未删除备份。');
-      for (const item of selected) await removeHistoryBackup(parent, item.backup);
+      for (const item of selected) await removeHistoryBackup(parent, item.backup, tool);
     } else {
       const selected = await vscode.window.showQuickPick(choices, { title: '浏览历史备份' });
       if (!selected || !await browseFiles(selected.backup.directory, '浏览历史备份')) throw new Error('已取消：未打开备份。');
     }
   }
 
-  private codexPublicConfig(): PublicConfigFile {
-    return { version: 2, organizations: { codex: this.codexOrganization?.read() ?? emptyOrganization() }, providers: this.store.getProvidersByTool('codex').filter(p => p.codexMode !== 'official').map(p => ({ ...p, baseUrl: publicEndpoint(p.baseUrl), configText: p.configText ? redactConfigText('codex', p.configText) : p.configText })) };
+  private codexPublicConfig(tool: ToolId = 'codex'): PublicConfigFile {
+    return { version: 2, organizations: { [tool]: this.organization(tool)?.read() ?? emptyOrganization() }, providers: this.store.getProvidersByTool(tool).filter(p => p.codexMode !== 'official').map(p => ({ ...p, baseUrl: publicEndpoint(p.baseUrl), configText: p.configText ? redactConfigText(tool, p.configText) : p.configText })) };
   }
-  private async exportCodexProviders(): Promise<void> {
-    const state = await this.sessionController.state();
+  private async exportCodexProviders(tool: ToolId = 'codex'): Promise<void> {
+    const state = await (tool === 'codex' ? this.sessionController : this.claudeSessions).state();
     if (!state.root || state.legacy) throw new Error('请先连接数据目录。');
     const directory = join(state.root, 'providers'); await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-    const file = join(directory, 'codex-public-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json');
-    await fs.writeFile(file, JSON.stringify(this.codexPublicConfig(), null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+    const file = join(directory, tool + '-public-' + new Date().toISOString().replace(/[:.]/g, '-') + '.json');
+    await fs.writeFile(file, JSON.stringify(this.codexPublicConfig(tool), null, 2) + '\n', { flag: 'wx', mode: 0o660 });
+    if (process.platform !== 'win32') await fs.chmod(file, 0o660);
   }
 
   private async exportPublicConfig(tool?: ToolId): Promise<void> {
@@ -1676,7 +1884,7 @@ export class VSModelSwitchApp implements vscode.Disposable {
     });
     if (!uri) throw new Error('已取消：文件操作未执行。');
 
-    const config: PublicConfigFile = tool === 'codex' ? this.codexPublicConfig() : tool === 'claude' ? { version: 1, providers: this.store.getProvidersByTool('claude').map(p => ({ ...p, configText: p.configText ? redactConfigText('claude', p.configText) : p.configText })) } : {
+    const config: PublicConfigFile = tool ? this.codexPublicConfig(tool) : {
       version: 1,
       currentProviderIds: this.store.getCurrentProviderIds(),
       providers: this.store.getProviders()
@@ -1731,13 +1939,13 @@ export class VSModelSwitchApp implements vscode.Disposable {
       }
     }
     validateImportedNames(providers);
-    const previousOrganization = this.codexOrganization?.read() ?? emptyOrganization();
-    const nextOrganization = tool !== 'claude' ? importOrganization(previousOrganization, parsed.version === 2 ? parsed.organizations?.codex : undefined, mode.value as 'merge' | 'replace', imported.filter(p => p.tool === 'codex').map(p => p.id), providers.filter(p => p.tool === 'codex').map(p => p.id), 'codex') : undefined;
+    const tools: ToolId[] = tool ? [tool] : ['codex', 'claude'];
+    const organizations = tools.map(id => ({ store: this.organization(id), before: this.organization(id).read(), next: importOrganization(this.organization(id).read(), parsed.version === 2 ? parsed.organizations?.[id] : undefined, mode.value as 'merge' | 'replace', imported.filter(p => p.tool === id).map(p => p.id), providers.filter(p => p.tool === id).map(p => p.id), id) }));
     try {
       await this.store.saveProviders(providers);
-      if (nextOrganization) await this.codexOrganization.save(nextOrganization);
+      for (const org of organizations) await org.store.save(org.next);
     } catch (error) {
-      try { await this.store.saveProviders(previousProviders); if (nextOrganization) await this.codexOrganization.save(previousOrganization); }
+      try { await this.store.saveProviders(previousProviders); for (const org of organizations) await org.store.save(org.before); }
       catch { throw new Error('供应商导入失败，定义恢复未完成；请保留原导出文件并检查存储状态。'); }
       throw error;
     }

@@ -1,4 +1,5 @@
 import { ProxyConfig } from '../../types';
+import { PROXY_PRESETS } from '../../proxy/config';
 export function renderProxyFields(prefix: string): string {
   const id = (name: string) => `${prefix}Proxy${name}`;
   const numbers = [
@@ -18,7 +19,7 @@ export function renderProxyFields(prefix: string): string {
     <div class="field"><label for="${id('Mode')}">Connection mode</label><select id="${id('Mode')}"><option value="direct">Direct connection</option><option value="proxy">Built-in proxy</option></select></div>
     <div id="${id('Options')}" class="proxyOptions" hidden>
       <div id="${id('ApiFormatField')}" class="field" hidden><label for="${id('ApiFormat')}">Upstream API format</label><select id="${id('ApiFormat')}"><option value="responses">OpenAI Responses</option><option value="anthropic">Anthropic Messages (translate Codex requests)</option></select><div class="small">Choose the API your provider serves. Changing the format restores that format's preset defaults. Anthropic translation needs full history and stream rebuilding; hosted OpenAI tools and encrypted OpenAI state require Responses.</div></div>
-      <div class="field"><label for="${id('Preset')}">Compatibility preset</label><select id="${id('Preset')}"><option value="justdowork">justdowork</option><option value="custom">Custom upstream</option></select></div>
+      <div class="field"><label for="${id('Preset')}">Compatibility preset</label><select id="${id('Preset')}">${PROXY_PRESETS.map(preset => `<option value="${preset.id}">${preset.label}</option>`).join('')}</select><div id="${id('PresetHint')}" class="usageNote"></div></div>
       <div class="small">Enter the real upstream URL and key above. The local endpoint is generated on Apply. Keep this VS Code window open while using the proxy.</div>
       <details><summary>Advanced proxy settings</summary><div class="field">
         <button id="${id('Reset')}" type="button">Restore preset defaults</button>

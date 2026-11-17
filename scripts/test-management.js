@@ -75,7 +75,7 @@ async function main() {
     const opened = {}; app.lastEnv = { OPENAI_BASE_URL: 'http://codex.invalid', ANTHROPIC_BASE_URL: 'http://claude.invalid' };
     app.networkProxy = { environment: tool => ({ HTTPS_PROXY: tool === 'codex' ? 'http://127.0.0.1:15001' : 'http://127.0.0.1:15002' }) };
     app.terminalManager = { openCodex: env => { opened.codex = env; }, openClaude: env => { opened.claude = env; } };
-    app.applyProvider = () => { throw Error('Opening a terminal must not Apply'); }; app.sessionController.assertReady = () => {};
+    app.applyProvider = () => { throw Error('Opening a terminal must not Apply'); }; app.sessionController.assertReady = () => {}; app.claudeSessions={assertReady(){},state:async()=>({runtimeConfigDir:'/synthetic/claude'})};app.runtimeState={claude:{mode:'api'}};
     await app.openClaudeTerminal(); await app.openCodexTerminal(); assert.equal(opened.claude.HTTPS_PROXY, 'http://127.0.0.1:15002'); assert.equal(opened.codex.HTTPS_PROXY, 'http://127.0.0.1:15001');
     assert.equal(opened.claude.OPENAI_BASE_URL, undefined); assert.equal(opened.codex.ANTHROPIC_BASE_URL, undefined);
   });

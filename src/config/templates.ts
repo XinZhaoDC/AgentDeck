@@ -68,6 +68,7 @@ export function redactConfigText(tool: ToolId, text: string): string {
       ? parsed.env as Record<string, unknown> : {};
     env.ANTHROPIC_AUTH_TOKEN = '';
     if ('ANTHROPIC_API_KEY' in env) env.ANTHROPIC_API_KEY = '';
+    if ('CLAUDE_CODE_OAUTH_TOKEN' in env) env.CLAUDE_CODE_OAUTH_TOKEN = '';
     parsed.env = env;
     return `${JSON.stringify(parsed, null, 2)}\n`;
   }

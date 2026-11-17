@@ -1,3 +1,4 @@
+import { historySourceCommand, writeHistorySource, withCodexHistorySource } from '../../storage/historySources';
 import * as fs from 'fs/promises';
 import { pathExists } from '../../config/atomicWrite';
 import { FileRecovery } from '../../config/recovery';
@@ -28,7 +29,10 @@ export class CodexAdapter {
     if (sqlite) content = setTopLevelValue(content, 'sqlite_home', sqlite);
     validateConfigText('codex', content);
 
+    const source = resolved.historySource ? { ...resolved.historySource, version: 1 as const, tool: 'codex' as const, providerId: resolved.codex.providerId, providerName: resolved.codex.providerName } : undefined;
+    if (source) content = withCodexHistorySource(content, historySourceCommand(getToolHome('codex')));
     await FileRecovery.run(this.recoveryDirectory(), async tx => {
+      if (source) await writeHistorySource(tx, getToolHome('codex'), source);
       await tx.write(configPath, content);
       await tx.write(authPath, '');
     });

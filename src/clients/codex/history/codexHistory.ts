@@ -4,6 +4,8 @@ import { createHash, randomUUID } from 'crypto';
 import { createInterface } from 'readline';
 import { createReadStream } from 'fs';
 import { CodexProfiles, IdentityKind } from './codexProfiles';
+import { ClaudeHistoryScope } from '../../claude/historyScope';
+import { shareHistory } from './sharedPermissions';
 
 export interface SessionSummary { file: string; id: string; title: string; cwd: string; updatedAt: string; archived: boolean; provider: string }
 interface BackupManifest { version: 1; kind: IdentityKind; name: string; createdAt: string; files: Array<{ file: string; sha256: string }> }
@@ -44,19 +46,20 @@ export async function sessionMarkdown(home: string, file: string): Promise<strin
 
 /** Backups contain resumable conversation data, never auth/config/skills.
  * Caller must close all writers first; before/after hashes detect a changing input. */
-export async function backupHistory(home: string, parent: string, kind: IdentityKind, name: string): Promise<string> {
+export async function backupHistory(home: string, parent: string, kind: IdentityKind, name: string, tool: 'codex' | 'claude' = 'codex'): Promise<string> {
   const relative = path.relative(path.resolve(home), path.resolve(parent));
   if (!relative || !relative.startsWith('..') && !path.isAbsolute(relative)) throw new Error('Backup destination must be outside the Codex home');
-  const files = await historyFiles(home), before = await fingerprints(home, files);
-  const target = path.join(parent, 'codex-history-' + randomUUID());
+  const files = await historyFiles(home, tool), before = await fingerprints(home, files);
+  const target = path.join(parent, tool + '-history-' + randomUUID());
   await fs.mkdir(target, { recursive: true, mode: 0o700 });
   for (const file of files) {
     await assertRegular(home, file); await fs.mkdir(path.dirname(path.join(target, file)), { recursive: true, mode: 0o700 });
     await fs.copyFile(path.join(home, file), path.join(target, file)); await fs.chmod(path.join(target, file), 0o600);
   }
-  if (JSON.stringify(before) !== JSON.stringify(await fingerprints(home, await historyFiles(home))) || JSON.stringify(before) !== JSON.stringify(await fingerprints(target, files))) throw new Error('History changed during backup. Incomplete folder retained; close all Codex clients and retry.');
+  if (JSON.stringify(before) !== JSON.stringify(await fingerprints(home, await historyFiles(home, tool))) || JSON.stringify(before) !== JSON.stringify(await fingerprints(target, files))) throw new Error('History changed during backup. Incomplete folder retained; close all Codex clients and retry.');
   const manifest: BackupManifest = { version: 1, kind, name, createdAt: new Date().toISOString(), files: before };
   await fs.writeFile(path.join(target, 'manifest.json'), JSON.stringify(manifest, null, 2), { mode: 0o600 });
+  await shareHistory(target);
   return target;
 }
 
@@ -92,14 +95,15 @@ function safeRelative(file: string): boolean { return typeof file === 'string' &
 function isHistoryFile(file: string): boolean {
   return /^(sessions|archived_sessions)\/.+\.jsonl$/.test(file) || /^(history|session_index)\.jsonl$/.test(file) || /^(?:sqlite\/)?[a-zA-Z0-9_-]+\.sqlite(?:-(?:wal|shm))?$/.test(file);
 }
-async function historyFiles(home: string): Promise<string[]> {
+async function historyFiles(home: string, tool: 'codex' | 'claude' = 'codex'): Promise<string[]> {
   const files: string[] = [];
+  const excluded = tool === 'claude' ? await new ClaudeHistoryScope(home, '').excluded() : new Set<string>();
   const walk = async (directory: string) => {
     const entries = await fs.readdir(path.join(home, directory), { withFileTypes: true }).catch((e: NodeJS.ErrnoException) => { if (e.code === 'ENOENT') return []; throw e; });
     for (const e of entries) {
       const file = directory ? directory + '/' + e.name : e.name;
-      if (e.isDirectory() && (/^(sessions|archived_sessions|sqlite)$/.test(file) || directory)) await walk(file);
-      else if (e.isFile() && isHistoryFile(file)) files.push(file);
+      if (e.isDirectory() && ((tool === 'claude' ? file === 'projects' : /^(sessions|archived_sessions|sqlite)$/.test(file)) || directory)) await walk(file);
+      else if (e.isFile() && !excluded.has(file) && (tool === 'claude' ? file.startsWith('projects/') : isHistoryFile(file))) files.push(file);
     }
   };
   await walk(''); return files.sort();

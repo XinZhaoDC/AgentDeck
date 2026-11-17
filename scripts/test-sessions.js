@@ -38,7 +38,7 @@ async function main() {
     assert.equal(await fs.readFile(path.join(runtimeA, 'sessions/2026/11/10/rollout-new.jsonl'), 'utf8'), rollout('new'));
     assert.deepEqual(new Set((await listSessions(a.home(first))).map(s => s.id)), new Set(['old', 'new']));
     await assert.rejects(fs.readFile(path.join(a.home(first), 'auth.json')), { code: 'ENOENT' });
-    assert.equal(await fs.readFile(path.join(a.sqliteHome(first), 'state_5.sqlite'), 'utf8'), 'opaque-fixture-index');
+    assert.equal(await fs.readFile(path.join(a.home(first), 'sqlite', 'state_5.sqlite'), 'utf8'), 'opaque-fixture-index');
   });
   await test('same-account refreshed authentication remains private to each environment', async () => {
     await write(runtimeB, 'auth.json', '{"tokens":{"access_token":"synthetic-b"}}');

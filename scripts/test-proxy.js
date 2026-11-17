@@ -47,7 +47,7 @@ const sandboxRoot = settings.testHome;
 const { ClaudeAdapter } = require('../out/clients/claude/adapter');
 const { CodexAdapter } = require('../out/clients/codex/adapter');
 ClaudeAdapter.prototype.getConfigPath = () => path.join(sandboxRoot, '.claude/settings.json');
-ClaudeAdapter.prototype.readActiveConfig = async () => ({ baseUrl: appliedClaude.env?.ANTHROPIC_BASE_URL, key: appliedClaude.env?.ANTHROPIC_AUTH_TOKEN, model: appliedClaude.model });
+ClaudeAdapter.prototype.readActiveConfig = async () => ({ baseUrl: appliedClaude.env?.ANTHROPIC_BASE_URL, key: appliedClaude.env?.ANTHROPIC_AUTH_TOKEN, model: appliedClaude.model, mode: 'api' });
 ClaudeAdapter.prototype.apply = async function (resolved) {
   if (failWrite) throw new Error('Synthetic configuration write failure');
   appliedClaude = JSON.parse(resolved.claude.configText);
@@ -64,6 +64,7 @@ CodexAdapter.prototype.apply = async resolved => {
 CodexAdapter.prototype.applyOfficialMode = async () => { appliedCodex = { mode: 'official' }; writes++; };
 const runtimeGuard = require('../out/shared/runtimeGuard');
 runtimeGuard.confirmCodexChange = async () => true;
+runtimeGuard.confirmClientChange = async () => true;
 runtimeGuard.inspectCodexActivity = async () => ({ extension: 'idle', cli: 'idle', checkedAt: 'fixture' });
 const { VSModelSwitchApp } = require('../out/app');
 const { SidebarViewProvider } = require('../out/ui/sidebarView');
@@ -246,7 +247,8 @@ async function testApplication(base, _offered, clear, offered, config) {
   const ctx = context(), app = new VSModelSwitchApp(ctx);
   await new Promise(resolve => setImmediate(resolve));
   try {
-    await app.createProviderFromSidebar({ tool: 'claude', name: 'Alpha', baseUrl: base, key: 'synthetic-secret-a', model: 'test-model', applyNow: true, proxy: config() });
+    const group=await app.claudeOrganization.createGroup('API defaults');await app.claudeOrganization.saveGroupDefaults(group,{proxy:config()});
+    await app.createProviderFromSidebar({ groupId:group, tool: 'claude', name: 'Alpha', baseUrl: base, key: 'synthetic-secret-a', model: 'test-model', applyNow: true, proxy: config() });
     let state = await app.getSidebarState(), alpha = state.providers.find(p => p.name === 'Alpha');
     const endpoint = { baseUrl: appliedClaude.env.ANTHROPIC_BASE_URL, key: appliedClaude.env.ANTHROPIC_AUTH_TOKEN };
     check('Apply starts a proxy and persists only local credentials in client config', () => { assert.equal(alpha.proxyRuntime.state, 'running'); assert.equal(endpoint.key, 'vscodemodelswitch-local'); assert.equal(state.currentProviderIds.claude, alpha.id); assert.equal(JSON.stringify(appliedClaude).includes('synthetic-secret'), false); });
@@ -291,7 +293,8 @@ async function testUnsyncedApplication(base, config) {
   const ctx = context(), app = new VSModelSwitchApp(ctx), before = writes;
   try {
     await new Promise(resolve => setImmediate(resolve));
-    await app.createProviderFromSidebar({ tool: 'claude', name: 'Unsynced', baseUrl: base, key: 'synthetic-secret-unsynced', model: 'unsynced-model', applyNow: true, proxy: config() });
+    const group=await app.claudeOrganization.createGroup('API defaults');await app.claudeOrganization.saveGroupDefaults(group,{proxy:config()});
+    await app.createProviderFromSidebar({ groupId:group, tool: 'claude', name: 'Unsynced', baseUrl: base, key: 'synthetic-secret-unsynced', model: 'unsynced-model', applyNow: true, proxy: config() });
     const state = await app.getSidebarState();
     check('terminal-only mode keeps its active identity/model without rewriting global config', () => { assert.equal(writes, before); assert.equal(state.currentProviderIds.claude, state.providers[0].id); assert.equal(state.apiStatuses.find(row => row.tool === 'claude').model, 'unsynced-model'); assert.equal(app.lastEnv.ANTHROPIC_AUTH_TOKEN, 'vscodemodelswitch-local'); });
     app.dispose();
@@ -307,6 +310,7 @@ async function testUnsyncedApplication(base, config) {
 function testUi() {
   const html = new SidebarViewProvider(vscode.Uri.file('/extension'), {}).getHtml();
   const { elements, messages, fire } = require('./sidebar-fixture').sidebarFixture(html, { activeTool: 'claude' });
+  fire({ type:'state',state:{providers:[],currentProviderIds:{},apiStatuses:[],claudeMode:'api',codexMode:'api',configPaths:{},toolEnabled:{claude:true,codex:true},storageSizes:{},globalCliSync:true} });
   fire({ type: 'busy', busy: false });
   const form = prefix => (name => elements.get(prefix + 'Proxy' + name));
   fire({ type: 'configEditor', providerId: 'existing', tool: 'claude', text: '{"env":{}}', hasKey: true, proxy: config({ timeoutMs: 5000 }) });
@@ -320,11 +324,11 @@ function testUi() {
   fire({ type: 'busy', busy: false });
   elements.get('providerName').value = 'New'; elements.get('baseUrl').value = 'https://upstream.invalid'; elements.get('apiKey').value = 'synthetic'; elements.get('modelSelect').value = 'model'; form('add')('Mode').value = 'proxy';
   elements.get('providerForm').listeners.submit({ preventDefault() {} });
-  check('Add Provider form includes proxy settings with real upstream fields', () => { assert.equal(messages.at(-1).type, 'createProvider'); assert.equal(messages.at(-1).payload.proxy.mode, 'proxy'); assert.equal(messages.at(-1).payload.baseUrl, 'https://upstream.invalid'); });
+  check('Add Provider keeps real upstream fields while connection controls are hidden', () => { assert.equal(messages.at(-1).type, 'createProvider'); assert.equal(form('add')('').hidden,true); assert.equal(messages.at(-1).payload.baseUrl, 'https://upstream.invalid'); });
   const provider = { id: 'existing', name: 'Existing', tool: 'claude', modelPolicy: { type: 'fixed', model: 'model' }, hasKey: true, proxy: config(), needsApply: true, proxyRuntime: { state: 'running', requests: 1, succeeded: 0, failed: 1, retries: 0, trimmedMessages: 0, lastRequest: { ok: false, status: 503, error: 'all nodes exhausted', durationMs: 5 } } };
-  fire({ type: 'state', state: { providers: [provider], currentProviderIds: { claude: 'existing' }, apiStatuses: [], configPaths: {}, toolEnabled: { claude: true, codex: true }, storageSizes: {}, globalCliSync: true } });
+  fire({ type: 'state', state: { providers: [provider], claudeMode:'api', currentProviderIds: { claude: 'existing' }, apiStatuses: [], configPaths: {}, toolEnabled: { claude: true, codex: true }, storageSizes: {}, globalCliSync: true } });
   const allText = element => element.textContent + ' ' + element.children.map(allText).join(' ');
-  check('card separates local Running, upstream failure and Pending Apply', () => { const text = allText(elements.get('claudeProviders')); assert.match(text, /兼容转发：运行中/); assert.match(text, /失败 · HTTP 503/); assert.match(text, /等待应用/); });
+  check('card separates local Running, upstream failure and Pending Apply', () => { const text = allText(elements.get('codexProviders')); assert.match(text, /兼容转发：运行中/); assert.match(text, /失败 · HTTP 503/); assert.match(text, /等待应用/); });
   fire({ type: 'busy', busy: false }); elements.get('closeConfigButton').listeners.click(); elements.get('codexPageTab').listeners.click();
   fire({ type: 'configEditor', providerId: 'codex-existing', tool: 'codex', text: 'model_provider = "OpenAI"', hasKey: true,
     proxy: { mode: 'proxy', preset: 'custom', apiFormat: 'responses', overrides: { timeoutMs: 7000 } } });
@@ -410,9 +414,9 @@ function testUi() {
   const networkState = config => ({ ...officialState, networkProxy: { tools: { codex: { config, managed: true, message: config ? 'Restart clients' : 'Original settings restored' } } } });
   fire({ type: 'state', state: networkState(undefined) });
   check('network proxy Off has an explicit badge and a disabled current-state action', () => {
-    assert.match(elements.get('networkProxyBadge').textContent, /未管理代理/);
+    assert.match(elements.get('networkProxyBadge').textContent, /未应用代理/);
     assert.equal(networkButton('apply').disabled, false); assert.equal(networkButton('restore').disabled, true);
-    assert.match(networkButton('apply').textContent, /启用代理/);
+    assert.match(networkButton('apply').textContent, /应用代理/);
     assert.equal(networkButton('apply').className, 'primary');
     const count = messages.length; networkButton('restore').listeners.click(); assert.equal(messages.length, count);
   });
@@ -434,7 +438,7 @@ function testUi() {
   networkButton('apply').listeners.click();
   check('network proxy Apply targets the active Codex page only and does not optimistically report chat success', () => {
     assert.equal(messages.at(-1).type, 'applyNetworkProxy'); assert.equal(messages.at(-1).config.claude, false); assert.equal(messages.at(-1).tool, 'codex');
-    assert.equal(messages.at(-1).config.codex, true); assert.match(elements.get('networkProxyBadge').textContent, /未管理代理/);
+    assert.equal(messages.at(-1).config.codex, true); assert.match(elements.get('networkProxyBadge').textContent, /未应用代理/);
     assert.match(networkButton('apply').textContent, /应用中/);
     const count = messages.length; networkButton('apply').listeners.click(); assert.equal(messages.length, count);
   });
@@ -442,15 +446,15 @@ function testUi() {
     message: 'Restart clients', test: { checkedAt: 'fixture time', proxyUrl: proxyConfig.url, results: [{ target: 'https://fixture.invalid', reachable: true, status: 401 }] } } } } };
   fire({ type: 'state', state: enabledState }); fire({ type: 'busy', busy: false });
   check('network proxy display separates enabled configuration, transport reachability and chat verification', () => {
-    assert.match(elements.get('networkProxyStatus').textContent, /代理配置.*Restart/);
+    assert.match(elements.get('networkProxyStatus').textContent, /代理设置.*Restart/);
     assert.match(elements.get('networkProxyTest').textContent, /HTTP 401/); assert.match(elements.get('networkProxyTest').textContent, /未验证登录或聊天/);
     assert.equal(networkButton('restore').disabled, false);
   });
   check('enabled proxy badge and checked current button make the confirmed state visible', () => {
-    assert.match(elements.get('networkProxyBadge').textContent, /已配置代理/);
+    assert.match(elements.get('networkProxyBadge').textContent, /已应用代理/);
     assert.match(elements.get('networkProxyBadge').className, /enabled/);
     assert.equal(networkButton('apply').disabled, true);
-    assert.match(networkButton('apply').textContent, /已配置代理|已启用/);
+    assert.match(networkButton('apply').textContent, /已应用代理/);
     assert.equal(networkButton('apply').className, 'networkProxyCurrent');
     const count = messages.length; networkButton('apply').listeners.click(); assert.equal(messages.length, count);
   });
@@ -459,7 +463,7 @@ function testUi() {
     assert.equal(networkButton('apply').disabled, false); assert.match(networkButton('apply').textContent, /应用更改/);
     assert.equal(networkButton('apply').className, 'primary');
     assert.match(elements.get('networkProxyStatus').textContent, /有更改待应用/);
-    assert.match(elements.get('networkProxyBadge').textContent, /已配置代理|已启用/);
+    assert.match(elements.get('networkProxyBadge').textContent, /已应用代理/);
   });
   elements.get('networkProxyUrl').value = proxyConfig.url; elements.get('networkProxyUrl').listeners.input();
   check('reverting a draft disables redundant Apply again', () => assert.equal(networkButton('apply').disabled, true));
@@ -477,7 +481,7 @@ function testUi() {
   check('failed Apply preserves the draft and confirmed state, then unlocks retry', () => {
     assert.equal(elements.get('networkProxyUrl').value, 'http://127.0.0.1:12002');
     assert.equal(networkButton('apply').disabled, false); assert.equal(elements.get('networkProxyUrl').disabled, false);
-    assert.match(elements.get('networkProxyBadge').textContent, /已配置代理|已启用/);
+    assert.match(elements.get('networkProxyBadge').textContent, /已应用代理/);
     assert.match(networkButton('apply').textContent, /应用更改/);
   });
   networkButton('apply').listeners.click();
@@ -490,17 +494,17 @@ function testUi() {
   check('network proxy Restore is independent from API compatibility proxy controls', () => assert.equal(messages.at(-1).type, 'restoreNetworkProxy'));
   check('Restore immediately locks repeated actions without prematurely showing disabled', () => {
     assert.match(networkButton('restore').textContent, /停用中/); assert.equal(networkButton('restore').disabled, true);
-    assert.match(elements.get('networkProxyBadge').textContent, /已配置代理|已启用/);
+    assert.match(elements.get('networkProxyBadge').textContent, /已应用代理/);
     const count = messages.length; networkButton('restore').listeners.click(); assert.equal(messages.length, count);
   });
   fire({ type: 'error', action: 'restoreNetworkProxy', message: 'Synthetic restore failure' }); fire({ type: 'busy', busy: false });
   check('failed Restore keeps Enabled visible and allows retry', () => {
-    assert.match(elements.get('networkProxyBadge').textContent, /已配置代理|已启用/); assert.equal(networkButton('restore').disabled, false);
+    assert.match(elements.get('networkProxyBadge').textContent, /已应用代理/); assert.equal(networkButton('restore').disabled, false);
   });
   networkButton('restore').listeners.click();
   fire({ type: 'state', state: networkState(undefined) }); fire({ type: 'busy', busy: false });
   check('confirmed Restore marks Disabled and blocks repeated Restore after busy clears', () => {
-    assert.match(elements.get('networkProxyBadge').textContent, /未管理代理/);
+    assert.match(elements.get('networkProxyBadge').textContent, /未应用代理/);
     assert.equal(networkButton('restore').disabled, true); assert.equal(networkButton('apply').disabled, false);
     const count = messages.length; networkButton('restore').listeners.click(); assert.equal(messages.length, count);
   });
@@ -509,17 +513,17 @@ function testUi() {
   fire({ type: 'state', state: splitState });
   elements.get('networkProxyUrl').value = 'http://127.0.0.1:14000'; elements.get('networkProxyUrl').listeners.input();
   elements.get('claudePageTab').listeners.click();
-  check('Claude page hides Codex and loads its own proxy without applying it', () => {
-    assert.equal(elements.get('codexSection').hidden, true); assert.equal(elements.get('claudeSection').hidden, false);
+  check('Claude page uses the shared layout and loads only its own proxy without applying it', () => {
+    assert.equal(elements.get('codexSection').hidden, false);
     assert.equal(elements.get('networkProxyUrl').value, 'http://127.0.0.1:13000'); assert.equal(elements.get('tool').value, 'claude');
-    assert.equal(elements.get('codexSessionControls').hidden, true); assert.equal(elements.get('claudeSessionsLater').hidden, false);
+    assert.equal(elements.get('codexSessionControls').hidden, false);assert.equal(elements.get('claudeOfficialGuide').hidden,false);
   });
   elements.get('copyNetworkSettingsButton').listeners.click();
   check('explicit copy sends clipboard data without changing the other tool or draft', () => { assert.equal(elements.get('networkProxyUrl').value, 'http://127.0.0.1:13000'); assert.equal(messages.at(-1).type, 'networkClipboard'); assert.equal(messages.at(-1).action, 'copy'); });
   fire({ type: 'busy', busy: false });
   elements.get('codexPageTab').listeners.click();
   check('returning to Codex preserves its own unapplied draft', () => {
-    assert.equal(elements.get('networkProxyUrl').value, 'http://127.0.0.1:14000'); assert.equal(elements.get('claudeSection').hidden, true);
+    assert.equal(elements.get('networkProxyUrl').value, 'http://127.0.0.1:14000'); assert.equal(elements.get('claudeOfficialGuide').hidden,true);
   });
   fire({ type: 'state', state: { ...networkState(undefined), sessions: { root: '/data/codex', attached: true, activeId: 'account-a', identities: [
     { id: 'account-a', name: 'A', kind: 'official' }, { id: 'account-b', name: 'B', kind: 'official' }
@@ -542,9 +546,11 @@ async function testCodexApplication(base, offered) {
   let reloaded;
   try {
     await new Promise(resolve => setImmediate(resolve));
-    await app.createProviderFromSidebar({ tool: 'claude', name: 'CC paired', baseUrl: base, key: 'synthetic-secret-cc-paired', model: 'cc-paired', applyNow: true, proxy: { mode: 'proxy', preset: 'custom' } });
+    const claudeGroup=await app.claudeOrganization.createGroup('API defaults');await app.claudeOrganization.saveGroupDefaults(claudeGroup,{proxy:{mode:'proxy',preset:'custom'}});
+    await app.createProviderFromSidebar({ groupId:claudeGroup, tool: 'claude', name: 'CC paired', baseUrl: base, key: 'synthetic-secret-cc-paired', model: 'cc-paired', applyNow: true, proxy: { mode: 'proxy', preset: 'custom' } });
     const ccUrl = appliedClaude.env.ANTHROPIC_BASE_URL;
-    await app.createProviderFromSidebar({ tool: 'codex', name: 'Codex paired', baseUrl: base, key: 'synthetic-secret-codex', model: 'codex-paired', applyNow: true, proxy: config });
+    const codexGroup=await app.codexOrganization.createGroup('API defaults');await app.codexOrganization.saveGroupDefaults(codexGroup,{proxy:config});
+    await app.createProviderFromSidebar({ groupId:codexGroup, tool: 'codex', name: 'Codex paired', baseUrl: base, key: 'synthetic-secret-codex', model: 'codex-paired', applyNow: true, proxy: config });
     let state = await app.getSidebarState(), provider = state.providers.find(item => item.tool === 'codex');
     const endpoint = { ...appliedCodex }, edit = await app.getProviderConfigFromSidebar(provider.id);
     await request(endpoint);

@@ -47,7 +47,7 @@ suites = ['test-codex-modes.js', 'test-codex-proxy.js', 'test-network.js',
           'test-codex-ui.js', 'test-codex-workflows.js', 'test-provider-groups.js',
           'test-group-ui.js', 'test-group-import.js', 'test-environments.js', 'test-native-history.js',
           'test-codex-network.js', 'test-native-codex-network.js',
-          'test-management.js', 'test-codex-diagnostics.js']
+          'test-management.js', 'test-codex-diagnostics.js', 'test-api-enrollment.js', 'test-group-settings.js']
 manifest = {'out': str(Path(args.out).resolve()), 'suites': {}, 'scope': 'Codex only; other-client cases excluded, not counted as passes'}
 for suite in suites:
     source = (repo / 'scripts' / suite).read_text()

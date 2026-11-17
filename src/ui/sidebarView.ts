@@ -1,8 +1,9 @@
+import { managedPageScript } from '../shared/ui/providerPage';
 import { createClientRegistry } from '../clients';
 import type { ClientModule } from '../shell/clientRegistry';
 import { renderProxyFields } from '../shared/ui/proxyFields';
 import { ClientRegistry } from '../shell/clientRegistry';
-import type { OrganizationAction } from '../clients/codex/organizationController';
+import type { OrganizationAction } from '../shared/providers/controller';
 import type { OrganizationView } from '../shared/providers/organization';
 import { localeScript, userFacingError } from './locale';
 import { OfficialCodexInfo } from '../clients/codex/diagnostics/info';
@@ -11,7 +12,9 @@ import { sessionPanelHtml, sessionPanelScript, storagePanelHtml } from '../clien
 import { SessionAction, SessionState } from '../clients/codex/history/controller';
 import * as vscode from 'vscode';
 import { ApiStatusRow, CodexMode, CompatibilityResult, ModelInfo, ModelPolicy, NetworkTestResult, ProviderProfile, ProxyConfig, ProxyRuntime, StatusState, ToolId, UsageQueryConfig, UsageQueryResult } from '../types';
-import { proxyDefaults } from '../proxy/config';
+import { proxyDefaults, PROXY_PRESETS } from '../proxy/config';
+import { USAGE_PRESETS } from '../models/usagePresets';
+import { usagePresetOptions } from '../shared/ui/usageFields';
 import { SpeedReport } from '../speed/types';
 import { NetworkProxyState } from '../network/manager';
 import { NetworkProxyConfig } from '../network/transport';
@@ -42,6 +45,9 @@ export interface SidebarProviderSummary {
 
 export interface SidebarViewState {
   codexOrganization?: OrganizationView;
+  claudeOrganization?: OrganizationView;
+  claudeSessions?: SessionState;
+  claudeMode?: CodexMode | 'unknown';
   reloadNotices?: ReloadNotice[];
   networkPresets?: Partial<Record<ToolId, Array<NetworkProxyConfig & { name: string }>>>;
   networkProxy?: NetworkProxyState;
@@ -51,6 +57,7 @@ export interface SidebarViewState {
   officialSpeedResult?: SpeedReport;
   speedDirectory: string;
   logDirectory: string;
+  logDirectories?: Partial<Record<ToolId, string>>;
   providers: SidebarProviderSummary[];
   currentProviderIds: Partial<Record<ToolId, string>>;
   status: StatusState;
@@ -83,10 +90,10 @@ export interface CreateProviderInput {
 }
 
 export interface SidebarController {
-  organizationActionFromSidebar(input: OrganizationAction): Promise<Record<string, unknown>>;
+  organizationActionFromSidebar(input: OrganizationAction, tool?: ToolId): Promise<Record<string, unknown>>;
   recordOperation(event: OperationEvent): Promise<void>;
-  logActionFromSidebar(action: 'view' | 'folder' | 'export'): Promise<void>;
-  sessionActionFromSidebar(action: SessionAction, id?: string, file?: string): Promise<void>;
+  logActionFromSidebar(action: 'view' | 'folder' | 'export', tool?: ToolId): Promise<void>;
+  sessionActionFromSidebar(action: SessionAction, id?: string, file?: string, tool?: ToolId): Promise<void>;
   applyNetworkProxyFromSidebar(config: NetworkProxyConfig, tool?: ToolId): Promise<void>;
   restoreNetworkProxyFromSidebar(tool?: ToolId): Promise<void>;
   testNetworkProxyFromSidebar(config: NetworkProxyConfig, tool?: ToolId): Promise<void>;
@@ -102,6 +109,7 @@ export interface SidebarController {
   controlProxyFromSidebar(providerId: string, action: 'start' | 'stop' | 'restart' | 'log'): Promise<void>;
   applyProviderFromSidebar(providerId: string): Promise<void>;
   applyCodexModeFromSidebar(mode: CodexMode): Promise<void>;
+  applyClaudeModeFromSidebar(mode: CodexMode): Promise<void>;
   deleteProviderFromSidebar(providerId: string): Promise<void>;
   moveProviderFromSidebar(providerId: string, beforeProviderId: string): Promise<void>;
   testProviderNetworkFromSidebar(providerId: string): Promise<void>;
@@ -121,7 +129,7 @@ export interface SidebarController {
   viewConfigFromSidebar(tool: ToolId): Promise<void>;
   exportPublicConfigFromSidebar(tool?: ToolId): Promise<void>;
   importPublicConfigFromSidebar(tool?: ToolId): Promise<void>;
-  clearLogFromSidebar(): Promise<boolean>;
+  clearLogFromSidebar(tool?: ToolId): Promise<boolean>;
 }
 
 export type IncomingMessage = (
@@ -140,6 +148,7 @@ export type IncomingMessage = (
   | { type: 'controlProxy'; providerId: string; action: 'start' | 'stop' | 'restart' | 'log' }
   | { type: 'applyProvider'; providerId: string }
   | { type: 'applyCodexMode'; mode: CodexMode }
+  | { type: 'applyClaudeMode'; mode: CodexMode }
   | { type: 'deleteProvider'; providerId: string }
   | { type: 'moveProvider'; providerId: string; beforeProviderId: string }
   | { type: 'testProviderNetwork'; providerId: string }
@@ -252,7 +261,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
       await this.postFeedback(target, page, cancelled ? 'cancelled' : 'failed', text + logFailure + (cancelled ? '' : '（操作编号：' + id.slice(0, 8) + '）'));
       // The module itself carries Codex errors; don't duplicate them in a
       // notification or scroll the user away from the originating controls.
-      if (page === 'claude' && !cancelled) void vscode.window.showErrorMessage(`AgentDeck：${text}`);
+
       await this.refresh().catch(() => {});
     } finally {
       this.handling = false;
@@ -403,6 +412,11 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
       font-size: 11px;
       line-height: 16px;
     }
+    .networkProxyState { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px 12px; }
+    .networkAppliedSettings { flex: 1 1 220px; min-width: 0; margin: 0; padding: 3px 0 3px 9px; border-left: 3px solid var(--vscode-testing-iconPassed, #73c991); display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 8px; }
+    .networkAppliedSettings[hidden] { display: none; }
+    .networkAppliedSettings dt { color: var(--vscode-descriptionForeground); }
+    .networkAppliedSettings dd { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
     .networkProxyBadge {
       display: inline-block;
       align-self: flex-start;
@@ -507,21 +521,36 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
     .diagnosticDetails button { margin-top: 3px; min-height: 24px; }
 
     .networkBody { display: contents; }
-    .codexPage .module { border: 1px solid var(--vscode-widget-border, #555); border-radius: 6px; background: var(--vscode-editor-background); min-width: 0; }
-    .codexPage .module > summary, .codexPage .submodule > summary { cursor: pointer; padding: 10px; line-height: 1.5; }
-    .codexPage summary h2, .codexPage summary h3 { display: inline; font-weight: 650; }
-    .codexPage .module > summary h2 { font-size: 14px; }
-    .codexPage .submodule > summary h3 { font-size: 13px; }
-    .codexPage .moduleBody { display: flex; flex-direction: column; gap: 9px; padding: 0 10px 10px; min-width: 0; }
-    .codexPage .submodule { border: 1px solid var(--vscode-sideBarSectionHeader-border, #444); border-radius: 5px; min-width: 0; }
-    .codexPage .proxyDetails, .codexPage .diagnosticDetails, .codexPage .proxySettings details { border: 1px solid var(--vscode-sideBarSectionHeader-border, #444); border-radius: 5px; padding: 7px; }
-    .codexPage .proxyDetails summary, .codexPage .diagnosticDetails summary, .codexPage .proxySettings summary { cursor: pointer; font-size: 12px; font-weight: 650; }
-    .codexPage .moduleBody > .panel, .codexPage #codexToolPanel, .codexPage #providerForm { border: 0; padding: 0; background: transparent; }
-    .codexPage #codexToolPanel { padding: 0 10px 10px; }
-    .codexPage #status { border: 0; background: transparent; }
-    .codexPage #networkProxyPanel { display: block; padding: 0; }
-    .codexPage #addProviderSection { margin-top: 8px; }
-    .codexPage .providerList { gap: 9px; }
+    #codexNetworkRouteHelp p { margin: 0; }
+    #codexNetworkRouteHelp ul { margin: 5px 0; padding-left: 18px; }
+    .managedPage .module { border: 1px solid var(--vscode-widget-border, #555); border-radius: 6px; background: var(--vscode-editor-background); min-width: 0; }
+    .managedPage .module > summary, .managedPage .submodule > summary { cursor: pointer; padding: 10px; line-height: 1.5; }
+    .managedPage summary h2, .managedPage summary h3 { display: inline; font-weight: 650; }
+    .managedPage .module > summary h2 { font-size: 14px; }
+    .managedPage .submodule > summary h3 { font-size: 13px; }
+    .managedPage .moduleBody { display: flex; flex-direction: column; gap: 9px; padding: 0 10px 10px; min-width: 0; }
+    .managedPage .submodule { border: 1px solid var(--vscode-sideBarSectionHeader-border, #444); border-radius: 5px; min-width: 0; }
+    .managedPage .proxyDetails, .managedPage .diagnosticDetails, .managedPage .proxySettings details { border: 1px solid var(--vscode-sideBarSectionHeader-border, #444); border-radius: 5px; padding: 7px; }
+    .managedPage .proxyDetails summary, .managedPage .diagnosticDetails summary, .managedPage .proxySettings summary { cursor: pointer; font-size: 12px; font-weight: 650; }
+    .managedPage .moduleBody > .panel, .managedPage #codexToolPanel, .managedPage #providerForm { border: 0; padding: 0; background: transparent; }
+    .managedPage #codexToolPanel { padding: 0 10px 10px; }
+    .managedPage #status { border: 0; background: transparent; }
+    .managedPage #networkProxyPanel { display: block; padding: 0; }
+    .managedPage #addProviderSection { margin-top: 8px; }
+    .managedPage .providerList { gap: 9px; }
+    .managedPage .organizationHeading, .managedPage .providerHeading { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .managedPage .organizationName { flex: 1; min-width: 90px; overflow-wrap: anywhere; }
+    .managedPage .groupTitle { display: flex; align-items: center; gap: 8px; }
+    .managedPage .groupCollapse { flex: 0 0 auto; cursor: pointer; font-weight: 600; }
+    .managedPage .organizationHeading { list-style: none; }
+    .managedPage .organizationHeading::-webkit-details-marker { display: none; }
+    .managedPage .groupActions, .managedPage .providerHeadingActions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 5px; margin-left: auto; }
+    .managedPage button.clientToggle { position: relative; min-width: 62px; width: 62px; height: 28px; border: 1px solid var(--vscode-widget-border); border-radius: 20px; padding: 2px 7px 2px 25px; font-size: 11px; font-weight: 700; background: var(--vscode-input-background); color: var(--vscode-input-foreground); }
+    .managedPage button.clientToggle::after { content: ''; position: absolute; left: 4px; top: 4px; width: 18px; height: 18px; border-radius: 50%; background: currentColor; }
+    .managedPage button.clientToggle[aria-checked="true"] { background: #267965; color: #fff; padding: 2px 25px 2px 7px; }
+    .managedPage button.clientToggle[aria-checked="true"]::after { left: auto; right: 4px; }
+    .managedPage .dragReady { outline: 2px dashed var(--vscode-focusBorder); cursor: grabbing; }
+    .managedPage .organizationHeading, .managedPage .providerHeading { cursor: grab; }
     .operationNotice { display: flex; align-items: start; gap: 7px; padding: 8px 10px; border: 1px solid var(--vscode-focusBorder, #007acc); border-radius: 5px; overflow-wrap: anywhere; }
     .operationNotice.success { border-color: var(--vscode-testing-iconPassed, #73c991); background: rgba(60, 150, 90, 0.12); }
     .operationNotice.error { border-color: var(--vscode-inputValidation-errorBorder, #f14c4c); background: var(--vscode-inputValidation-errorBackground, #492020); }
@@ -533,10 +562,64 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
     .moduleIntro { margin: 0; color: var(--vscode-descriptionForeground); font-size: 12px; line-height: 1.55; }
     .usageNote { margin: 0; padding: 6px 8px; border-left: 2px solid var(--vscode-textLink-foreground); color: var(--vscode-descriptionForeground); font-size: 11px; line-height: 1.6; }
     .environmentBadge { padding: 9px; border: 1px solid var(--vscode-focusBorder); border-radius: 5px; font-weight: 600; overflow-wrap: anywhere; }
-    .codexPage #codexOverview > .actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .managedPage #codexOverview > .actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .overviewFacts { display: grid; grid-template-columns: minmax(90px, 1fr) minmax(0, 2fr); gap: 6px 10px; margin: 0; font-size: 12px; }
     .overviewFacts dt { color: var(--vscode-descriptionForeground); } .overviewFacts dd { margin: 0; overflow-wrap: anywhere; }
-    .codexPage #codexAccountsBody > section { margin: 0; } .codexPage h4 { font-size: 12px; margin: 0; }
+    .managedPage #codexAccountsBody > section { margin: 0; } .managedPage h4 { font-size: 12px; margin: 0; }
+    /* The hierarchy is expressed by surfaces and spacing as well as headings:
+       module > section > group > provider > inset settings. */
+    .managedPage {
+      --deck-module: var(--vscode-editor-background);
+      --deck-group: color-mix(in srgb, var(--vscode-editor-background) 94%, var(--vscode-foreground) 6%);
+      --deck-card: color-mix(in srgb, var(--vscode-editor-background) 88%, var(--vscode-foreground) 12%);
+      --deck-inset: color-mix(in srgb, var(--vscode-editor-background) 98%, var(--vscode-foreground) 2%);
+      --deck-accent: var(--vscode-textLink-foreground, #3794ff);
+      --deck-outline-module: color-mix(in srgb, var(--deck-accent) 26%, var(--vscode-editor-background) 74%);
+      --deck-outline-section: color-mix(in srgb, var(--deck-accent) 36%, var(--vscode-editor-background) 64%);
+      --deck-outline-card: color-mix(in srgb, var(--deck-accent) 48%, var(--vscode-editor-background) 52%);
+      --deck-outline-inset: color-mix(in srgb, var(--deck-accent) 65%, var(--vscode-editor-background) 35%);
+      gap: 18px;
+    }
+    .managedPage .module { background: var(--deck-module); border-radius: 9px; border-color: var(--deck-outline-module); }
+    .managedPage .submodule { border-color: var(--deck-outline-section); }
+    .managedPage .module > summary { padding: 13px 12px; border-bottom: 1px solid transparent; }
+    .managedPage .module[open] > summary { border-bottom-color: var(--deck-outline-module); margin-bottom: 12px; }
+    .managedPage .module > summary h2 { font-size: 15px; font-weight: 750; letter-spacing: .2px; }
+    .managedPage .moduleBody { gap: 12px; padding: 0 12px 12px; }
+    .managedPage #codexProvidersDetails { border: 0; border-radius: 0; }
+    .managedPage #codexProvidersDetails > summary { padding-left: 0; }
+    .managedPage #codexToolPanel { padding: 0; }
+    .managedPage .providerGroup { background: var(--deck-group); border-radius: 8px; border-color: var(--deck-outline-section); }
+    .managedPage .providerGroup > summary { font-weight: 650; padding: 11px; }
+    .managedPage .groupProviders { padding: 5px 9px 10px; gap: 12px; }
+    .managedPage .provider { background: var(--deck-card); border: 1px solid var(--deck-outline-card); border-radius: 7px; padding: 12px; gap: 10px; }
+    .managedPage .provider.active { border: 2px solid var(--vscode-focusBorder, #007acc); }
+    .managedPage .providerName { font-size: 14px; font-weight: 700; }
+    .managedPage .provider > .submodule { background: var(--deck-inset); border: 0; border-left: 2px solid var(--deck-outline-inset); border-radius: 3px; }
+    .managedPage .provider > .submodule > summary { padding: 9px; font-size: 12px; }
+    .managedPage #configEditor { margin: 4px 0 0; padding: 0; min-width: 0; }
+    .managedPage #codexConfigEditorDetails { background: var(--deck-inset); border: 0; border-left: 3px solid var(--vscode-focusBorder); border-radius: 4px; }
+    .managedPage #codexConfigEditorDetails > summary { padding: 11px; }
+    .managedPage #codexConfigEditorTitle { font-size: 13px; font-weight: 700; }
+    .managedPage #configEditorBody { padding: 0 10px 12px; }
+    .managedPage .settingsSection, .managedPage #codexRequestDetails, .managedPage #codexUsageDetails { background: transparent; border: 0; border-top: 1px solid var(--deck-outline-section); border-radius: 0; }
+    .managedPage .settingsSection > summary { cursor: pointer; padding: 10px 0; }
+    .managedPage .settingsSection summary h4 { display: inline; font-weight: 650; }
+    .managedPage .settingsBody { display: flex; flex-direction: column; gap: 10px; padding: 0 10px 12px; min-width: 0; }
+    .managedPage .nestedEditor, .managedPage .presetEditor { min-width: 0; margin: 0; border: 1px solid var(--deck-outline-inset); border-radius: 7px; background: var(--deck-inset); }
+    .managedPage .editorHeading { display: flex; align-items: center; gap: 8px; padding: 11px; border-left: 3px solid var(--vscode-focusBorder); margin-bottom: 10px; }
+    .managedPage .editorHeading h3, .managedPage .editorHeading h4 { margin: 0; flex: 1; font-size: 13px; }
+    .managedPage .presetEditor { display: flex; flex-direction: column; gap: 10px; padding: 12px; }
+    .managedPage .presetEditor legend { font-size: 12px; font-weight: 650; padding: 0 5px; }
+    .managedPage .proxyDetails, .managedPage .diagnosticDetails { border-color: var(--deck-outline-inset); }
+    .managedPage .proxySettings details { border: 0; border-left: 1px solid var(--deck-outline-section); border-radius: 0; }
+    .managedPage .usageNote, .managedPage .workflowHint { border-left: 3px solid var(--deck-accent); background: color-mix(in srgb, var(--deck-accent) 5%, var(--deck-inset) 95%); }
+    .managedPage .historySettingsAction { display: flex; flex-direction: column; align-items: stretch; gap: 12px; padding-top: 12px; border-top: 1px solid var(--deck-outline-section); }
+    .managedPage .historyIndexStatus { color: var(--vscode-editorWarning-foreground); }
+    .managedPage .provider .badge { align-self: flex-start; width: auto; }
+    .managedPage .currentUse { color: var(--deck-accent); background: color-mix(in srgb, var(--deck-accent) 13%, var(--deck-module) 87%); border: 1px solid var(--deck-accent); font-weight: 750; }
+    .managedPage .badge.currentUse { font-size: 12px; padding: 3px 9px; }
+    .managedPage button.currentUse:disabled { opacity: 1; cursor: default; }
     .persistentError { color: var(--vscode-errorForeground, #f14c4c); } .operationRecoveryError { outline: 1px solid var(--vscode-inputValidation-errorBorder, #f14c4c); border-radius: 5px; }
     .reloadRequired { outline: 1px solid var(--vscode-editorWarning-foreground, #cca700); border-radius: 5px; }
     .reloadAdvisory { outline: 1px solid var(--vscode-focusBorder); border-radius: 5px; }
@@ -565,7 +648,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
       <div id="codexOverview" hidden>
         <div id="codexEnvironmentStatus" class="environmentBadge"></div>
         <p class="usageNote">ⓘ 注：影响运行的设置变更前会要求确认；请先结束扩展和 CLI 中正在进行的任务。</p>
-        <dl id="codexOverviewFacts" class="overviewFacts"></dl><div class="actions"><button id="viewCodexConfigButton">打开当前配置 / Open current files</button><button id="openCodexButton">打开 Codex 终端 / Open Codex terminal</button></div><details class="submodule" data-fold="management"><summary><h3>配置管理 / Configuration management</h3></summary><div class="moduleBody"><label class="toolSwitch"><input id="codexEnabled" type="checkbox" checked> 启用 Codex 配置管理 / Manage Codex configuration</label><p class="usageNote">ⓘ 注：停用后本插件不再应用 Codex 配置；不会卸载 Codex，也不会撤销已写入配置。终端按钮启动命令行客户端，不更换当前供应商。</p></div></details>
+        <dl id="codexOverviewFacts" class="overviewFacts"></dl><div class="actions"><button id="viewCodexConfigButton">打开当前配置 / Open current files</button><button id="openCodexButton">打开 Codex 终端 / Open Codex terminal</button></div><details class="submodule" data-fold="management"><summary><h3>配置管理 / Configuration management</h3></summary><div class="moduleBody"><label class="toolSwitch"><input id="codexEnabled" type="checkbox" checked><span id="manageClientLabel">启用 Codex 配置管理</span></label><p class="usageNote">ⓘ 注：停用后本插件不再应用当前客户端配置；不会卸载客户端，也不会撤销已写入配置。终端按钮启动命令行客户端，不更换当前供应商。</p></div></details>
       </div>
     </div>
     </details></section>
@@ -574,27 +657,39 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
     <section id="networkSection" class="section moduleWrap"><details class="panel" id="networkProxyPanel" data-fold="network">
       <summary><h2 id="networkProxyTitle">网络设置 / Network</h2></summary>
       <div class="networkBody">
-      <p class="moduleIntro">设置当前工具使用的 HTTP 代理入口。Codex 与 Claude 分别保存和应用；VPN 节点选择及浏览器路由由 VPN 或浏览器管理。</p>
-      <div id="networkProxyBadge" class="networkProxyBadge" role="status" aria-live="polite">读取状态中 / Loading</div>
+      <p id="networkScopeIntro" class="moduleIntro">为当前客户端的扩展插件设置 HTTP 代理入口。VPN 节点选择及浏览器路由由 VPN 或浏览器管理。</p>
+      <div class="networkProxyState">
+        <div id="networkProxyBadge" class="networkProxyBadge" role="status" aria-live="polite">读取状态中 / Loading</div>
+        <dl id="networkAppliedSettings" class="networkAppliedSettings" aria-label="已应用的代理配置" hidden>
+          <dt>备注</dt><dd id="networkAppliedNote"></dd>
+          <dt>代理入口</dt><dd id="networkAppliedUrl"></dd>
+          <dt>绕过代理</dt><dd id="networkAppliedBypass"></dd>
+        </dl>
+      </div>
       <div id="networkProxyActions" class="actions three">
         <button id="testNetworkProxyButton" class="secondary" disabled>测试连接 / Test</button>
         <button id="applyNetworkProxyButton" class="primary" disabled>启用代理 / Enable</button>
         <button id="restoreNetworkProxyButton" class="secondary" disabled>已停用 / Disabled</button>
       </div>
       <div id="networkProxyStatus" class="small"></div>
-      <div class="field"><label for="networkPreset">网络预设 / Network preset</label><select id="networkPreset"></select></div><div class="field"><label for="networkNote">备注 / Note</label><input id="networkNote" type="text" placeholder="例如：宿主机 VPN 入口"></div>
-      <div class="field"><label for="networkProxyUrl">HTTP 代理入口 / HTTP proxy URL</label><input id="networkProxyUrl" type="text" value="http://127.0.0.1:12000" autocomplete="off"></div>
-      <p class="usageNote">ⓘ 注：复制包含当前填写的代理入口、绕过列表和备注。粘贴只填入当前工具的草稿，不会立即启用，也不包含账号、API 密钥或历史记录。</p>
-      <div class="actions"><button id="copyNetworkSettingsButton">复制设置 / Copy settings</button><button id="pasteNetworkSettingsButton">粘贴设置 / Paste settings</button></div><div class="actions"><button id="saveNetworkPresetButton">保存为预设 / Save preset</button><button id="deleteNetworkPresetButton" class="danger">删除预设 / Delete preset</button></div>
-      <div class="field"><label for="networkProxyBypass">绕过代理的目标地址 / Bypass targets</label><input id="networkProxyBypass" type="text" value="localhost,127.0.0.1,::1" autocomplete="off"></div>
+      <fieldset id="networkPresetEditor" class="presetEditor">
+        <legend>网络预设内容 · 代理地址＋绕过列表＋备注</legend>
+        <div class="field"><label for="networkPreset">选择已保存预设（只填入草稿）</label><select id="networkPreset"></select></div>
+        <div class="field"><label for="networkNote">预设名称 / 备注</label><input id="networkNote" type="text" placeholder="例如：宿主机 VPN 入口"></div>
+        <div class="field"><label for="networkProxyUrl">HTTP 代理入口</label><input id="networkProxyUrl" type="text" value="http://127.0.0.1:12000" autocomplete="off"></div>
+        <div class="field"><label for="networkProxyBypass">绕过代理的目标地址（包含在预设中）</label><input id="networkProxyBypass" type="text" value="localhost,127.0.0.1,::1" autocomplete="off"></div>
+        <p class="usageNote">ⓘ 注：保存预设和复制设置均包含上方代理地址、绕过目标及备注。选择或粘贴预设只改草稿，不改变当前启停状态；点击上方“应用更改”后生效。</p>
+        <div class="actions"><button id="saveNetworkPresetButton">保存为预设</button><button id="deleteNetworkPresetButton" class="danger">删除预设</button></div>
+        <div class="actions"><button id="copyNetworkSettingsButton">复制设置</button><button id="pasteNetworkSettingsButton">粘贴设置</button></div>
+      </fieldset>
       <div id="networkProxyTest" class="small"></div>
-      <details class="submodule" data-fold="network-help"><summary><h3>网络使用说明 / Network guide</h3></summary><div class="moduleBody"><p class="usageNote">ⓘ 注：代理入口是 VPN 软件提供的本地 HTTP 监听地址，不是远端 VPN 节点。示例端口仅用于填写参考，请以 VPN 软件为准。host 网络容器可使用宿主回环地址，其他容器模式通常需要宿主可达地址。</p><p class="usageNote">ⓘ 注：访问目标如 api.example.com 时，若它不在绕过列表，请求交给代理；访问 localhost、127.0.0.1 或 ::1 时绕过 HTTP 代理。绕过列表填写目标主机，不填写完整网址。保留本地例外让客户端连接本地兼容转发。</p><p class="usageNote">ⓘ 注：连接测试只检查传输，不代表账号或聊天可用。粘贴和选择预设只更改草稿，应用后才改变启动配置。插件不自动切换为直连。</p><p class="usageNote">ⓘ 注：Codex Linux 独立入口目前为实验功能；应用前会说明公共启动注册及 Windows/WSL 限制。</p></div></details>
+      <details class="submodule" data-fold="network-help"><summary><h3>网络使用说明 / Network guide</h3></summary><div class="moduleBody"><div id="claudeNetworkRouteHelp" class="usageNote" hidden>ⓘ 注：代理同时保存到当前环境各已准备档案的原生配置，账号/API 切换保持相同路由。已运行的扩展和 CLI 需重启；外部终端须使用下方显示的 CLAUDE_CONFIG_DIR。浏览器授权页面的网络不受此设置控制。代理地址固定不代表出口 IP 固定；本插件不自动切换代理或在失败后改为直连。</div><div id="codexNetworkRouteHelp" class="usageNote" hidden><p><strong>共享代理与独立代理</strong>（Linux 扩展后台，重载后且未命中绕过列表）</p><ul><li>共享代理为空、本插件未应用：环境代理或直连。</li><li>仅 VS Code 的 http.proxy 有值：仍可使用共享代理。</li><li>仅本插件已应用代理：使用本插件代理。</li><li>两处都有代理：当前扩展后台优先使用本插件代理，其他功能仍可使用共享代理。</li></ul><p>停用本插件不等于断网；环境代理或系统 VPN/TUN 仍可能生效。填写预设、测试连接不改变已应用路由。</p></div><p class="usageNote">ⓘ 注：代理入口是 VPN 软件提供的本地 HTTP 监听地址，不是远端 VPN 节点。示例端口仅用于填写参考，请以 VPN 软件为准。host 网络容器可使用宿主回环地址，其他容器模式通常需要宿主可达地址。</p><p class="usageNote">ⓘ 注：访问目标如 api.example.com 时，若它不在绕过列表，请求交给代理；访问 localhost、127.0.0.1 或 ::1 时绕过 HTTP 代理。绕过列表填写目标主机，不填写完整网址。保留本地例外让客户端连接本地兼容转发。</p><p class="usageNote">ⓘ 注：连接测试只检查传输，不代表账号或聊天可用。粘贴和选择预设只更改草稿，应用后才改变启动配置。插件不自动切换为直连。</p><p id="codexExperimentalNetworkNote" class="usageNote">ⓘ 注：Codex Linux 独立入口目前为实验功能；应用前会说明公共启动注册及 Windows/WSL 限制。</p></div></details>
       </div>
     </details></section>
     ${sessionPanelHtml()}
     <section id="configEditor" class="section" hidden>
       <h2 id="configEditorHeading">Provider Configuration</h2>
-      <details id="codexConfigEditorDetails" class="submodule" open><summary><h3>供应商配置 / Configuration</h3></summary></details>
+      <details id="codexConfigEditorDetails" class="submodule" open><summary><h3 id="codexConfigEditorTitle" data-raw-value="true">供应商配置</h3></summary></details>
       <div class="panel" id="configEditorBody">
         <div id="configEditorTool" class="small"></div>
         <textarea id="configText" spellcheck="false"></textarea>
@@ -607,15 +702,10 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
         <div id="usageFields" class="field">
           <label for="usagePreset">Usage preset</label>
           <select id="usagePreset">
-            <option value="auto">Auto Detect</option>
-            <option value="generic">Generic Balance</option>
-            <option value="deepseek">DeepSeek</option>
-            <option value="siliconflow">SiliconFlow</option>
-            <option value="openrouter">OpenRouter</option>
-            <option value="newapi">New API</option>
-            <option value="custom">Custom</option>
+            ${usagePresetOptions()}
           </select>
-          <div id="usageAdvancedFields" class="field" hidden>
+          <div id="usagePresetHint" class="usageNote"></div>
+          <details id="usageAdvancedFields" class="settingsSection" hidden><summary>接口、字段与换算参数</summary><div class="settingsBody">
             <label for="usageUrl" title="Usage API URL. {{baseUrl}} is replaced with this Provider's Base URL.">Usage URL</label>
             <input id="usageUrl" type="text" placeholder="{{baseUrl}}/user/balance" autocomplete="off">
             <label for="usageRemainingPath" title="Dot-separated JSON path containing the remaining quota.">Remaining JSON path</label>
@@ -628,9 +718,9 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
             <input id="usageUnit" type="text" placeholder="USD" autocomplete="off">
             <label for="usageDivisor" title="Raw values are divided by this number before display.">Value divisor</label>
             <input id="usageDivisor" type="number" min="0.000001" step="any" value="1">
-          </div>
+          </div></details>
           <div id="newApiFields" class="field" hidden>
-            <label for="usageUserId" title="Required by New API-style management endpoints; optional for Auto Detect.">Management User ID</label>
+            <label id="usageUserIdLabel" for="usageUserId" title="Required by New API-style management endpoints; optional for Auto Detect.">Management User ID</label>
             <input id="usageUserId" type="text" autocomplete="off">
             <label for="usageAccessToken" title="Console access token, not the model API key.">Management Access Token</label>
             <input id="usageAccessToken" type="password" placeholder="Leave empty to keep the stored token" autocomplete="off">
@@ -660,10 +750,11 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
             <option value="codex">Codex</option>
           </select>
         </div>
-        <div id="codexProviderGroupField" class="field"><label for="codexProviderGroup">群组</label><select id="codexProviderGroup"></select><div class="actions"><button id="codexAddGroup" type="button">新建群组</button><button id="codexLoadGroupDefaults" type="button">载入群组模板</button></div><p class="usageNote">ⓘ 注：选择群组只决定归属；载入模板只填入草稿，保存后仍需明确应用。</p></div>
+        <div id="codexProviderGroupField" class="field"><label for="codexProviderGroup">群组</label><select id="codexProviderGroup"></select><p class="usageNote">ⓘ 注：群组可自由选择。有默认地址时自动填写，仍可手改；非独立群组已保存的请求处理和余额规则在创建时复制，未设置则使用默认值，之后均可单独编辑。</p></div>
         <div class="field">
-          <label for="providerName">Name</label>
-          <input id="providerName" type="text" placeholder="Local Mock" autocomplete="off" required>
+          <label for="providerName">供应商名称（当前客户端内唯一）</label>
+          <input id="providerName" type="text" placeholder="输入名称，可选择历史名称后修改" list="providerNameSuggestions" autocomplete="on" required>
+          <datalist id="providerNameSuggestions"></datalist>
         </div>
         <div class="field">
           <label for="addMode">Add mode</label>
@@ -711,7 +802,9 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
 
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
-    const proxyPresets = ${JSON.stringify({ anthropic: { justdowork: proxyDefaults('justdowork'), custom: proxyDefaults('custom') }, responses: { justdowork: proxyDefaults('justdowork', 'responses'), custom: proxyDefaults('custom', 'responses') } })};
+    const proxyPresets = ${JSON.stringify({ anthropic: Object.fromEntries(PROXY_PRESETS.map(preset => [preset.id, proxyDefaults(preset.id, 'anthropic')])), responses: Object.fromEntries(PROXY_PRESETS.map(preset => [preset.id, proxyDefaults(preset.id, 'responses')])) })};
+    const proxyPresetDescriptions = ${JSON.stringify(Object.fromEntries(PROXY_PRESETS.map(preset => [preset.id, preset.description])))};
+    const usagePresets = ${JSON.stringify(USAGE_PRESETS)};
     let state = {
       providers: [],
       currentProviderIds: {},
@@ -743,6 +836,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
     let networkProxyLoaded = false;
     let networkProxyPending = '';
     let fetchedModels = [];
+    const configDrafts = new Map();
     let configEditorProviderId = '';
     let configEditorTool = '';
     let templateTool = '';
@@ -771,15 +865,10 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
       syncStatus: document.getElementById('syncStatus'),
       storageStatus: document.getElementById('storageStatus'),
       notice: document.getElementById('notice'),
-      claudeProviders: document.getElementById('claudeProviders'),
       codexProviders: document.getElementById('codexProviders'),
-      claudeSection: document.getElementById('claudeSection'),
       codexSection: document.getElementById('codexSection'),
-      claudeToolPanel: document.getElementById('claudeToolPanel'),
       codexToolPanel: document.getElementById('codexToolPanel'),
-      claudeEnabled: document.getElementById('claudeEnabled'),
       codexEnabled: document.getElementById('codexEnabled'),
-      collapseClaudeButton: document.getElementById('collapseClaudeButton'),
       form: document.getElementById('providerForm'),
       tool: document.getElementById('tool'),
       providerName: document.getElementById('providerName'),
@@ -792,14 +881,9 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
       saveButton: document.getElementById('saveButton'),
       addNotice: document.getElementById('addNotice'),
       reloadButton: document.getElementById('reloadButton'),
-      openClaudeButton: document.getElementById('openClaudeButton'),
       openCodexButton: document.getElementById('openCodexButton'),
-      viewClaudeConfigButton: document.getElementById('viewClaudeConfigButton'),
       viewCodexConfigButton: document.getElementById('viewCodexConfigButton'),
-      claudePath: document.getElementById('claudePath'),
-      refreshClaudeModelsButton: document.getElementById('refreshClaudeModelsButton'),
       refreshCodexModelsButton: document.getElementById('refreshCodexModelsButton'),
-      testClaudeNetworkButton: document.getElementById('testClaudeNetworkButton'),
       testCodexNetworkButton: document.getElementById('testCodexNetworkButton'),
       exportButton: document.getElementById('exportButton'),
       importButton: document.getElementById('importButton'),
@@ -838,19 +922,19 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
       saveConfigButton: document.getElementById('saveConfigButton'),
       cancelConfigButton: document.getElementById('cancelConfigButton'),
       closeConfigButton: document.getElementById('closeConfigButton'),
-      deleteClaudeBackupsButton: document.getElementById('deleteClaudeBackupsButton'),
 
     };
 
     el.tool.value = activeTool;
     ${sessionPanelScript()}
+    ${managedPageScript()}
     ${this.clients.list().map(c => c.browser?.script ?? '').join('\n')}
     const clientPages = { ${this.clients.list().filter(c => c.browser).map(c => JSON.stringify(c.id) + ': new ' + c.browser!.controller + '()').join(', ')} };
 
     window.addEventListener('message', (event) => {
       const message = event.data;
       if (customClientIds.includes(activeTool) && !['state', 'busy'].includes(message.type)) { clientPages[activeTool]?.receive?.(message); return; }
-      if (message.type === 'organizationResult') { clientPages.codex.receive(message); return; }
+      if (message.type === 'organizationResult') { clientPages[message.tool || activeTool].receive(message); return; }
       if (message.type === 'state') {
         state = message.state;
         networkProxyLoaded = true;
@@ -868,9 +952,12 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
         return;
       }
       if (message.type === 'configEditor') {
+        rememberConfigDraft();
         configEditorProviderId = message.providerId;
         configEditorTool = message.tool;
-        el.configEditorTool.textContent = labelTool(message.tool) + (message.hasKey ? ' — 已保存 API 密钥' : ' — 尚未保存 API 密钥');
+        const ownerName = state.providers.find(p => p.id === message.providerId)?.name || message.providerId;
+        document.getElementById('codexConfigEditorTitle').textContent = '供应商配置 · ' + ownerName;
+        el.configEditorTool.textContent = ownerName + ' · ' + labelTool(message.tool) + (message.hasKey ? ' — 已保存 API 密钥' : ' — 尚未保存 API 密钥');
         el.configText.value = message.text;
         el.configKey.value = '';
         setUsageQuery(message.usageQuery);
@@ -881,13 +968,14 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
         configOriginalProxy = message.proxy;
         setProxyConfig('edit', message.proxy);
         updateProxyVisibility('edit', message.tool);
+        restoreConfigDraft(message.groupSettingsLoaded);
         el.configEditor.hidden = false;
         document.getElementById('codexConfigEditorDetails').open = true;
-        if (message.tool === 'codex') { const item = Array.from(el.codexProviders.querySelectorAll('[data-provider-id]')).find(node => node.dataset.providerId === message.providerId); if (item) item.after(el.configEditor); }
-        else document.getElementById('sessionPanel').after(el.configEditor);
+        { const item = Array.from(el.codexProviders.querySelectorAll('[data-provider-id]')).find(node => node.dataset.providerId === message.providerId); if (item) item.appendChild(el.configEditor); }
         return;
       }
       if (message.type === 'configSaved') {
+        configDrafts.delete(configEditorTool + ':' + configEditorProviderId);
         configOriginalText = message.text;
         configOriginalKey = '';
         configOriginalUsage = message.usageQuery;
@@ -913,8 +1001,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
         return;
       }
       if (message.type === 'providerCreated') {
-        el.applyNow.checked = false;
-
+        clientPages[message.tool]?.providerCreated(message.name);
         return;
       }
       if (message.type === 'modelFetchWarning') {
@@ -933,7 +1020,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
     function currentNetwork() { return state.networkProxy?.tools?.[activeTool] || {}; }
     function selectToolPage(tool) {
       if (busy) return;
-      if (configEditorProviderId && !el.configEditor.hidden) { showNotice('Close the configuration editor before changing tool pages.', true); return; }
+      if (configEditorProviderId && !el.configEditor.hidden) rememberConfigDraft();
+      el.configEditor.hidden = true; document.querySelector('.shell').appendChild(el.configEditor);
       clientPages[activeTool]?.leave?.();
       if (networkProxyDirty) networkDrafts[activeTool] = networkProxyInput();
       activeTool = tool; networkProxyDirty = Boolean(networkDrafts[tool]);
@@ -943,7 +1031,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
     }
     for (const id of registeredClientIds) document.getElementById(id + 'PageTab').addEventListener('click', () => selectToolPage(id));
     const networkNote = document.getElementById('networkNote'), presetSelect = document.getElementById('networkPreset');
-    const builtInNetworkPresets = [{ name: '本机 HTTP 入口（示例 12000）', url: 'http://127.0.0.1:12000' }, { name: '本机 HTTP 入口（示例 7890）', url: 'http://127.0.0.1:7890' }, { name: '宿主机地址（需环境支持）', url: 'http://host.docker.internal:7890' }];
+    const builtInNetworkPresets = [{ name: '本机 HTTP 入口（示例 12000）', noProxy:'localhost,127.0.0.1,::1', url: 'http://127.0.0.1:12000' }, { name: '本机 HTTP 入口（示例 7890）', noProxy:'localhost,127.0.0.1,::1', url: 'http://127.0.0.1:7890' }, { name: '宿主机地址（需环境支持）', noProxy:'localhost,127.0.0.1,::1', url: 'http://host.docker.internal:7890' }];
     function renderNetworkPresets() {
       const old = presetSelect.value; presetSelect.textContent = '';
       const empty = document.createElement('option'); empty.value = ''; empty.textContent = '选择预设（只填入草稿）'; presetSelect.appendChild(empty);
@@ -971,19 +1059,27 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
       return signature(a) === signature(b);
     }
     function renderNetworkProxyActions() {
+      document.getElementById('codexNetworkRouteHelp').hidden = activeTool !== 'codex';
+      document.getElementById('codexExperimentalNetworkNote').hidden = activeTool !== 'codex';
       const network = currentNetwork();
       const enabled = Boolean(network.config);
-      const changed = enabled && (!network.managed || !sameNetworkProxy(network.config, networkProxyInput()));
+      const applied = enabled && network.managed && !network.error;
+      const changed = enabled && (!applied || !sameNetworkProxy(network.config, networkProxyInput()));
       const locked = busy || !networkProxyLoaded;
-      el.networkProxyBadge.textContent = !networkProxyLoaded ? '读取状态中 / Loading' : enabled ? '● 已配置代理 / Proxy configured' : '○ 未管理代理 / Unmanaged';
-      el.networkProxyBadge.className = 'networkProxyBadge' + (enabled ? ' enabled' : '');
+      el.networkProxyBadge.textContent = !networkProxyLoaded ? '读取状态中 / Loading' : network.error ? '⚠ 代理应用状态异常' : applied ? '● 已应用代理 / Proxy applied' : '○ 未应用代理 / Proxy not applied';
+      el.networkProxyBadge.className = 'networkProxyBadge' + (applied ? ' enabled' : '');
+      document.getElementById('networkAppliedSettings').hidden = !applied;
+      document.getElementById('networkAppliedNote').textContent = applied ? network.config.note?.trim() || '临时设置' : '';
+      document.getElementById('networkAppliedUrl').textContent = applied ? network.config.url : '';
+      document.getElementById('networkAppliedBypass').textContent = applied ? network.config.noProxy || '无' : '';
       el.networkProxyStatus.className = network.error ? 'small persistentError' : 'small';
       document.getElementById('networkSection').classList.toggle('operationRecoveryError', Boolean(network.error));
-      el.networkProxyStatus.textContent = (enabled
-        ? uiText(changed ? '当前代理仍已启用；有更改待应用。 / Enabled — changes not applied. ' : '代理配置未变化。 / Proxy configuration unchanged. ')
-        : uiText('未接管客户端代理；原有环境或 VPN 仍可能提供路由。 / Client proxy is unmanaged; existing environment or VPN routes may still apply. ')) + ' ' + uiText(network.message || '');
+      el.networkProxyStatus.textContent = (network.error ? '代理应用状态核查异常，请检查后重新应用。'
+        : applied ? changed ? '已应用的代理继续使用；草稿有更改待应用。' : '当前代理设置已应用。'
+        : enabled ? '保存了旧代理设置，尚未应用到独立路由。'
+        : '尚未应用代理；原有环境或 VPN 仍可能提供路由。') + ' ' + uiText(network.message || '');
       el.applyNetworkProxyButton.textContent = networkProxyPending === 'apply' ? '应用中… / Applying…'
-        : !enabled ? '启用代理 / Enable' : changed ? '应用更改 / Apply changes' : '✓ 已启用 / Enabled';
+        : !applied ? '应用代理' : changed ? '应用更改 / Apply changes' : '✓ 已应用代理';
       el.applyNetworkProxyButton.className = enabled && !changed ? 'networkProxyCurrent' : 'primary';
       el.applyNetworkProxyButton.disabled = locked || enabled && !changed;
       el.restoreNetworkProxyButton.textContent = networkProxyPending === 'restore' ? '停用中… / Disabling…'
@@ -1014,27 +1110,20 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
     document.getElementById('officialInfoButton').addEventListener('click', () => post({ type: 'officialInfo' }));
     el.quickOfficialSpeedButton.addEventListener('click', () => post({ type: 'speedTest', runs: 1 }));
     el.standardOfficialSpeedButton.addEventListener('click', () => post({ type: 'speedTest', runs: 3 }));
-    el.openClaudeButton.addEventListener('click', () => post({ type: 'openClaudeTerminal' }));
-    el.openCodexButton.addEventListener('click', () => post({ type: 'openCodexTerminal' }));
-    el.viewClaudeConfigButton.addEventListener('click', () => post({ type: 'viewConfig', tool: 'claude' }));
-    el.viewCodexConfigButton.addEventListener('click', () => post({ type: 'viewConfig', tool: 'codex' }));
-    el.refreshClaudeModelsButton.addEventListener('click', () => post({ type: 'refreshModels', tool: 'claude' }));
+    el.openCodexButton.addEventListener('click', () => post({ type: activeTool === 'claude' ? 'openClaudeTerminal' : 'openCodexTerminal' }));
+    el.viewCodexConfigButton.addEventListener('click', () => post({ type: 'viewConfig', tool: activeTool }));
     el.refreshCodexModelsButton.addEventListener('click', () => post({ type: 'refreshModels', tool: 'codex' }));
-    el.testClaudeNetworkButton.addEventListener('click', () => post({ type: 'testToolNetwork', tool: 'claude' }));
-    el.testCodexNetworkButton.addEventListener('click', () => post({ type: 'testToolNetwork', tool: 'codex' }));
-    el.claudeEnabled.addEventListener('change', () => post({ type: 'setToolEnabled', tool: 'claude', enabled: el.claudeEnabled.checked }));
-    el.codexEnabled.addEventListener('change', () => post({ type: 'setToolEnabled', tool: 'codex', enabled: el.codexEnabled.checked }));
-    el.collapseClaudeButton.addEventListener('click', () => toggleCollapse('claude'));
+    el.testCodexNetworkButton.addEventListener('click', () => post({ type: 'testToolNetwork', tool: activeTool }));
+    el.codexEnabled.addEventListener('change', () => post({ type: 'setToolEnabled', tool: activeTool, enabled: el.codexEnabled.checked }));
     el.exportButton.addEventListener('click', () => post({ type: 'exportPublicConfig', tool: activeTool }));
     el.importButton.addEventListener('click', () => post({ type: 'importPublicConfig', tool: activeTool }));
     el.clearLogButton.addEventListener('click', () => post({ type: 'clearLog' }));
     for (const [id, action] of [['viewOperationLogButton', 'view'], ['openOperationLogButton', 'folder'], ['exportOperationLogButton', 'export']]) document.getElementById(id).addEventListener('click', () => post({ type: 'logAction', action }));
-    el.deleteClaudeBackupsButton.addEventListener('click', () => post({ type: 'deleteBackups', tool: 'claude' }));
     el.codexOfficialMode.addEventListener('click', () => submitCodexMode('official'));
     el.codexApiMode.addEventListener('click', () => submitCodexMode('api'));
     function submitCodexMode(mode) {
       if ((mode === 'official' ? el.codexOfficialMode : el.codexApiMode).disabled) return;
-      post({ type: 'applyCodexMode', mode });
+      post({ type: activeTool === 'claude' ? 'applyClaudeMode' : 'applyCodexMode', mode });
     }
     el.addMode.addEventListener('change', updateAddMode);
     el.tool.addEventListener('change', () => { resetModels(); setProxyConfig('add'); updateAddMode(); });
@@ -1047,16 +1136,14 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
     el.usagePreset.addEventListener('change', applyUsagePreset);
     el.testUsageButton.addEventListener('click', () => post({ type: 'testUsageQuery', providerId: configEditorProviderId, usageQuery: getUsageQuery(), usageAccessToken: el.usageAccessToken.value }));
     el.cancelConfigButton.addEventListener('click', () => {
+      configDrafts.delete(configEditorTool + ':' + configEditorProviderId);
       el.configText.value = configOriginalText;
       el.configKey.value = configOriginalKey;
       setUsageQuery(configOriginalUsage);
       setProxyConfig('edit', configOriginalProxy);
     });
     el.closeConfigButton.addEventListener('click', () => {
-      el.configText.value = configOriginalText;
-      el.configKey.value = configOriginalKey;
-      setUsageQuery(configOriginalUsage);
-      setProxyConfig('edit', configOriginalProxy);
+      rememberConfigDraft();
       el.configEditor.hidden = true;
     });
     el.fetchModelsButton.addEventListener('click', () => fetchModels());
@@ -1069,7 +1156,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
       el.modelSelect.addEventListener('input', updateSaveState);
 
     function setToolChoices(choices) {
-      if (el.tool.options.length !== choices.length) {
+      if (el.tool.options.length !== choices.length || choices.some(([value], i) => el.tool.options[i]?.value !== value)) {
         el.tool.textContent = ''; for (const [value, label] of choices) { const option = document.createElement('option'); option.value = value; option.textContent = label; el.tool.appendChild(option); }
       }
     }
@@ -1077,9 +1164,17 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
       for (const id of registeredClientIds) { const tab = document.getElementById(id + 'PageTab'); tab.disabled = busy; tab.className = activeTool === id ? 'primary' : ''; tab.setAttribute('aria-selected', String(activeTool === id)); }
       for (const id of customClientIds) document.getElementById('client-' + id).hidden = activeTool !== id;
       const custom = customClientIds.includes(activeTool);
-      for (const id of ['overviewSection', 'networkSection', 'codexAccountsSection', 'codexDataSection', 'claudeSection', 'codexSection', 'addProviderSection', 'configurationSection']) document.getElementById(id).hidden = custom;
+      for (const id of ['overviewSection', 'networkSection', 'codexAccountsSection', 'codexDataSection', 'codexSection', 'addProviderSection', 'configurationSection']) document.getElementById(id).hidden = custom;
       if (custom) { el.configEditor.hidden = true; clientPages[activeTool]?.render(state, busy); return; }
       clientPages[activeTool]?.layout?.();
+      const label = labelTool(activeTool);
+      el.openCodexButton.textContent = '打开 ' + label + ' 终端';
+      document.getElementById('manageClientLabel').textContent = '启用 ' + label + ' 配置管理';
+      document.getElementById('networkScopeIntro').textContent = activeTool === 'claude' ? '为当前客户端扩展和使用同一配置目录的 CLI 设置 HTTP 代理。浏览器登录及 VPN 节点由浏览器或 VPN 管理。' : '为当前客户端的扩展插件设置 HTTP 代理入口。VPN 节点选择及浏览器路由由 VPN 或浏览器管理。';
+      document.getElementById('claudeNetworkRouteHelp').hidden = activeTool !== 'claude';
+      document.getElementById('officialDiagnostics').hidden = activeTool !== 'codex';
+      document.getElementById('claudeOfficialGuide').hidden = activeTool !== 'claude';
+
       renderSessions();
       const network = currentNetwork();
       if (!networkProxyDirty) {
@@ -1092,21 +1187,17 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
       el.networkProxyTest.textContent = network.test ? '代理连接测试：' + network.test.proxyUrl + '；检查时间：' + network.test.checkedAt + '；' + network.test.results.map(item => item.target + ' — ' + (item.reachable ? '可达（HTTP ' + item.status + '）' : item.error)).join('；') + '。仅检查连接，未验证登录或聊天。' : '连接测试：本次启动尚未测试。启动时只核查本地配置；点击“测试连接”检查代理入口。';
       renderStatus();
       clientPages[activeTool]?.render();
-      el.claudePath.textContent = '配置位置：' + state.configPaths.claude;
-      el.claudeEnabled.checked = state.toolEnabled.claude;
-      el.codexEnabled.checked = state.toolEnabled.codex;
+      el.codexEnabled.checked = state.toolEnabled[activeTool];
       document.getElementById('officialInfoButton').disabled = busy || state.codexMode !== 'official' || !codexIdentityReady('official');
       const info = state.officialInfo; document.getElementById('officialInfoResult').dataset.rawValue = 'true'; document.getElementById('officialInfoResult').textContent = info ? ui('可用模型：', 'Available models: ') + (info.models.join(', ') || ui('未返回', 'None returned')) + '\\n' + ui('额度窗口：', 'Quota windows: ') + info.windows.map(w => ui('已用 ', 'Used ') + w.usedPercent + '%' + (w.minutes ? ' / ' + w.minutes + ui(' 分钟', ' minutes') : '')).join('; ') + '\\n' + info.unavailable.map(uiText).join('; ') : '';
       el.officialSpeedResult.hidden = state.codexMode !== 'official' || !codexIdentityReady('official');
       if (!el.officialSpeedResult.hidden) renderDiagnostics(el.officialSpeedResult, undefined, undefined, false, state.officialSpeedResult);
-      el.claudeSection.classList.toggle('toolDisabled', !state.toolEnabled.claude);
-      el.codexSection.classList.toggle('toolDisabled', !state.toolEnabled.codex || !codexApiEditable());
+      el.codexSection.classList.toggle('toolDisabled', !state.toolEnabled[activeTool] || !codexApiEditable());
       document.getElementById('codexApiReadOnly').textContent = codexApiEditable() ? '选择供应商并应用；配置只应用到当前环境。' : '当前为官方模式或等待重载，本区域只读。通过上方模式按钮切换到 API。';
-      applyCollapseState();
       updateActionState();
       updateSaveState();
       updateAddMode();
-      if (activeTool === 'codex' && !el.configEditor.hidden) { const provider = state.providers.find(p => p.id === configEditorProviderId); if (provider?.disabled || provider?.groupDisabled) for (const field of el.configEditor.querySelectorAll('input, select, textarea, button')) field.disabled = field.id !== 'closeConfigButton'; }
+      if (!el.configEditor.hidden) { const provider = state.providers.find(p => p.id === configEditorProviderId); if (provider?.disabled || provider?.groupDisabled) for (const field of el.configEditor.querySelectorAll('input, select, textarea, button')) field.disabled = field.id !== 'closeConfigButton'; }
       restoreFoldState();
       renderFeedback();
       renderOverviewFacts();
@@ -1116,10 +1207,10 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
 
     function renderOverviewFacts() {
       const node = document.getElementById('codexOverviewFacts'); node.textContent = '';
-      const row = state.apiStatuses.find(r => r.tool === 'codex') || {};
-      const p = state.providers.find(p => p.id === state.currentProviderIds.codex);
-      const network = state.networkProxy?.tools?.codex;
-      const facts = [['配置写入', state.globalCliSync ? state.configTarget === 'real' ? '当前环境的 Codex 配置文件' : '隔离测试目录' : '已关闭'], ['登录方式', labelMode(state.codexMode)], ['当前账号或供应商', state.codexMode === 'official' ? activeCodexIdentity()?.name || ui('未管理的官方账号', 'Unmanaged official account') : row.providerName || p?.name || ui('尚未应用', 'Not applied')], ['认证或连接配置', labelStatus(row.status)], ['聊天网络路由', network?.config ? network.config.url + (network.error ? '（配置核查异常，请查看网络设置）' : network.managed ? '（独立路由配置）' : '（旧网络配置，待重新应用）') : '未由本插件管理'], ['API 请求处理', state.codexMode !== 'api' ? '不适用' : p?.proxy?.mode === 'proxy' ? '本地协议兼容转发' : '直接调用 API'], ['默认模型', row.model || ui('由 Codex 客户端选择', 'Selected in Codex')], ['历史绑定', state.sessions?.root ? (state.sessions.attached ? activeCodexIdentity()?.name || '已连接' : '绑定异常') : '当前环境原目录'], ['配置位置', state.configPaths.codex || '读取中']];
+      const row = state.apiStatuses.find(r => r.tool === activeTool) || {};
+      const p = state.providers.find(p => p.id === state.currentProviderIds[activeTool]);
+      const network = state.networkProxy?.tools?.[activeTool];
+      const facts = [['配置写入', state.globalCliSync ? state.configTarget === 'real' ? '当前环境的 ' + labelTool(activeTool) + ' 配置文件' : '隔离测试目录' : '已关闭'], ['登录方式', labelMode(clientMode())], ['当前账号或供应商', clientMode() === 'official' ? activeCodexIdentity()?.name || ui('未管理的官方账号', 'Unmanaged official account') : row.providerName || p?.name || ui('尚未应用', 'Not applied')], ['认证或连接配置', labelStatus(row.status)], ['聊天网络路由', network?.config ? network.config.url + (network.error ? '（配置核查异常，请查看网络设置）' : network.managed ? '（独立路由配置）' : '（旧网络配置，待重新应用）') : '未由本插件管理'], ['API 请求处理', clientMode() !== 'api' ? '不适用' : p?.proxy?.mode === 'proxy' ? '本地协议兼容转发' : '直接调用 API'], ['默认模型', row.model || ui('由当前客户端选择', 'Selected in Codex')], ['历史绑定', clientSessions()?.root ? (clientSessions().attached ? activeCodexIdentity()?.name || '已连接' : '绑定异常') : '当前环境原目录'], ['配置位置', state.configPaths[activeTool] || '读取中']];
       for (const [key, value] of facts) { const k = document.createElement('dt'), v = document.createElement('dd'); k.textContent = key; v.textContent = value; if (key === '当前账号或供应商' || key === '默认模型') v.dataset.rawValue = 'true'; node.append(k, v); }
     }
 
@@ -1133,7 +1224,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
         const status = document.createElement('div'); status.textContent = labelStatus(row.status);
         if (row.tool === 'codex') {
           const active = activeCodexIdentity();
-          if (state.sessions?.restartRequired) {
+          if (clientSessions()?.restartRequired) {
             mode.textContent = '待重载 / Pending'; provider.textContent = active?.name || 'Identity changed';
             model.textContent = '—'; status.textContent = 'Reload required';
           } else if (active?.kind === 'api' && row.mode !== 'api') {
@@ -1143,66 +1234,47 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
         }
         el.statusRows.append(tool, mode, provider, model, status);
       }
-      el.syncStatus.hidden = activeTool === 'codex';
-      document.querySelector('.statusGrid').hidden = activeTool === 'codex';
-      el.storageStatus.hidden = activeTool === 'codex';
-      el.syncStatus.textContent = activeTool === 'codex' ? (state.globalCliSync ? state.configTarget === 'real' ? '配置写入：当前环境实际 CLI 文件' : '配置写入：隔离测试目录' : '配置写入：关闭，仅影响新终端环境') : state.globalCliSync ? 'Config sync: ' + state.configTarget : 'Config sync: Off';
-      document.getElementById('codexOverview').hidden = activeTool !== 'codex';
-      document.getElementById('codexEnvironmentStatus').textContent = '运行环境：' + (state.sessions?.environment || '读取中');
+      el.syncStatus.hidden = true;
+      document.querySelector('.statusGrid').hidden = true;
+      el.storageStatus.hidden = true;
+      el.syncStatus.textContent = state.globalCliSync ? '配置写入：当前环境实际 CLI 文件' : '配置写入：关闭';
+      document.getElementById('codexOverview').hidden = false;
+      document.getElementById('codexEnvironmentStatus').textContent = '运行环境：' + (clientSessions()?.environment || '读取中');
 
       const sizes = state.storageSizes || { logBytes: 0, backupBytes: 0, claudeBackupBytes: 0, codexBackupBytes: 0 };
-      el.storageStatus.textContent = activeTool === 'codex' ? '插件日志：' + formatBytes(sizes.logBytes) + '；账号数据位置见“数据与存储”。' : 'Storage: Log folder ' + formatBytes(sizes.logBytes) +
-        ' | Backup folders ' + formatBytes(sizes.backupBytes) +
-        ' (Claude ' + formatBytes(sizes.claudeBackupBytes) + ', Codex ' + formatBytes(sizes.codexBackupBytes) + ')';
-    }
-
-    function toggleCollapse(tool) {
-      collapsed[tool] = !collapsed[tool];
-      vscode.setState({ ...(vscode.getState() || {}), claudeCollapsed: collapsed.claude });
-      applyCollapseState();
-    }
-
-    function applyCollapseState() {
-      el.claudeToolPanel.hidden = collapsed.claude;
-      el.collapseClaudeButton.textContent = collapsed.claude ? '▸' : '▾';
-      el.collapseClaudeButton.title = collapsed.claude ? 'Expand Claude tool' : 'Collapse Claude tool';
+      el.storageStatus.textContent = '插件日志：' + formatBytes(sizes.logBytes) + '；账号数据位置见“数据与存储”。';
     }
 
     function renderProviderList(tool, container, enabled) {
       const editorHere = el.configEditor.parentElement === container;
       const locked = false;
       const providers = state.providers.filter((provider) => provider.tool === tool && (tool !== 'codex' || provider.codexMode !== 'official'));
-      if (tool === 'codex') enabled = enabled && codexApiEditable();
-      for (const node of [...container.querySelectorAll('[data-provider-id]')]) if (node.dataset.providerId && !providers.some(p => p.id === node.dataset.providerId)) { providerNodes.delete(tool + ':' + node.dataset.providerId); node.remove(); }
-      if (!providers.length && tool !== 'codex') {
-        container.textContent = '';
-        const empty = document.createElement('div');
-        empty.className = 'empty';
-        empty.textContent = 'No ' + labelTool(tool) + ' providers yet.';
-        container.appendChild(empty);
-        return;
-      }
-
+      enabled = enabled && codexApiEditable();
+      for (const node of [...container.querySelectorAll('[data-provider-id]')]) if (node.dataset.providerId && !providers.some(p => p.id === node.dataset.providerId)) { if (node === el.configEditor.parentElement) { el.configEditor.hidden = true; document.querySelector('.shell').appendChild(el.configEditor); } providerNodes.delete(tool + ':' + node.dataset.providerId); node.remove(); }
       for (const empty of container.querySelectorAll('.empty')) empty.remove();
       for (const provider of providers) {
         const providerEnabled = enabled && !provider.disabled && !provider.groupDisabled;
         const key = tool + ':' + provider.id;
-        const signature = JSON.stringify([provider, enabled, state.currentProviderIds[tool], state.codexMode, state.sessions?.environmentId, state.sessions?.activeId, state.sessions?.restartRequired, state.sessions?.attached]);
+        const signature = JSON.stringify([provider, enabled, state.currentProviderIds[tool], clientMode(tool), clientSessions(tool)?.environmentId, clientSessions(tool)?.activeId, clientSessions(tool)?.restartRequired, clientSessions(tool)?.attached]);
         const cached = providerNodes.get(key);
         if (cached?.signature === signature) continue;
-        const active = enabled && state.currentProviderIds[tool] === provider.id;
+        const active = state.currentProviderIds[tool] === provider.id && clientMode(tool) === 'api';
         const item = document.createElement('div');
         item.dataset.providerId = provider.id;
         item.className = 'provider' + (active ? ' active' : '') + (provider.disabled || provider.groupDisabled ? ' organizationDisabled' : '');
-        item.draggable = tool === 'claude' && enabled;
-        if (tool === 'claude') item.addEventListener('dragstart', event => event.dataTransfer.setData('text/plain', provider.id));
+        item.draggable = enabled;
         item.addEventListener('dragover', (event) => event.preventDefault());
         item.addEventListener('drop', (event) => {
           event.preventDefault();
           const providerId = event.dataTransfer.getData('application/agentdeck-provider') || event.dataTransfer.getData('text/plain');
           if (!providerId) return; // A group drag bubbles to the owning group's drop target.
           event.stopPropagation?.();
-          if (enabled && !busy && providerId && providerId !== provider.id) { if (tool === 'codex') clientPages.codex.send({ action: 'moveProvider', providerId, beforeProviderId: provider.id, groupId: provider.groupId || 'independent' }); else post({ type: 'moveProvider', providerId, beforeProviderId: provider.id }); }
+          if (enabled && !busy && providerId && providerId !== provider.id) {
+            {
+              const peers = clientPages[tool].providerPeers(provider), index = peers.findIndex(p => p.id === provider.id);
+              clientPages[tool].send({ action: 'moveProvider', providerId, beforeProviderId: codexDropAfter(event, item) ? peers[index + 1]?.id : provider.id, groupId: provider.groupId || 'independent' });
+            }
+          }
         });
 
         const meta = document.createElement('div');
@@ -1213,12 +1285,26 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
         const model = document.createElement('div');
         model.className = 'providerModel'; model.dataset.rawValue = 'true';
         model.textContent = labelModel(provider.modelPolicy);
-        meta.appendChild(name);
+        {
+          const heading = document.createElement('div'), controls = document.createElement('div');
+          heading.className = 'providerHeading'; name.classList.add('organizationName'); controls.className = 'providerHeadingActions';
+          heading.append(name, controls); meta.appendChild(heading);
+          const toggle = codexSwitch(!provider.disabled && !provider.groupDisabled, provider.name + '供应商', !enabled || provider.groupDisabled || active, () => clientPages[tool].send({ action: 'toggleProvider', providerId: provider.id, enabled: Boolean(provider.disabled) }));
+          if (active) toggle.title = '当前正在使用此供应商，请先切换其他供应商后再禁用。';
+          else if (provider.groupDisabled) toggle.title = '所在群组已禁用，请先恢复群组；成员自身启用状态保留。';
+          controls.appendChild(toggle);
+          for (const direction of [-1, 1]) {
+            const arrow = document.createElement('button'); arrow.type = 'button'; arrow.textContent = direction < 0 ? '↑' : '↓'; arrow.dataset.orderStep = String(direction);
+            arrow.title = direction < 0 ? '供应商上移一位' : '供应商下移一位'; arrow.setAttribute('aria-label', arrow.title);
+            arrow.addEventListener('click', event => { event?.stopPropagation?.(); if (!arrow.disabled) clientPages[tool].stepProvider(provider.id, direction); }); controls.appendChild(arrow);
+          }
+          codexHoldDrag(item, 'application/agentdeck-provider', provider.id, () => !busy && state.toolEnabled[tool] && codexApiEditable());
+        }
         meta.appendChild(model);
         if (active) {
           const badge = document.createElement('span');
-          badge.className = 'badge';
-          badge.textContent = 'Active';
+          badge.className = 'badge currentUse';
+          badge.textContent = '✓ 当前使用';
           meta.appendChild(badge);
         }
         const connection = document.createElement('div');
@@ -1278,19 +1364,18 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
         const actions = document.createElement('div');
         actions.className = 'rowActions';
         const applyButton = document.createElement('button');
-        applyButton.className = active ? '' : 'primary';
-        applyButton.textContent = 'Apply';
-        applyButton.disabled = locked || !providerEnabled || !provider.hasKey || tool === 'codex' && (!codexIdentityReady(provider.codexMode === 'official' ? 'official' : 'api') || !state.sessions?.root && state.codexMode === 'official' && provider.codexMode !== 'official');
-        if (tool === 'codex' && applyButton.disabled && !locked && enabled && provider.hasKey) applyButton.title = '请先在上方设置、启用匹配的身份并重载，再 Apply。';
+        const currentApplied = active && !provider.needsApply;
+        applyButton.className = currentApplied ? 'currentUse' : '';
+        applyButton.textContent = currentApplied ? '✓ 当前使用' : active && provider.needsApply ? '应用更改' : '应用';
+        applyButton.disabled = locked || !providerEnabled || !provider.hasKey || (!codexIdentityReady(provider.codexMode === 'official' ? 'official' : 'api') || !clientSessions(tool)?.root && clientMode(tool) === 'official' && provider.codexMode !== 'official');
+        if (applyButton.disabled && !locked && enabled && provider.hasKey) applyButton.title = '请先在上方设置、启用匹配的身份并重载，再 Apply。';
+        if (currentApplied) { applyButton.disabled = true; applyButton.title = '当前正在使用此供应商；配置有修改后可应用更改。'; }
         applyButton.addEventListener('click', () => post({ type: 'applyProvider', providerId: provider.id }));
         actions.appendChild(applyButton);
-        if (tool === 'codex') {
-        const drag = document.createElement('button'); drag.type = 'button'; drag.textContent = '↕ 排序'; drag.className = 'dragHandle'; drag.draggable = enabled; drag.disabled = !enabled;
-        drag.addEventListener('dragstart', event => { event.stopPropagation?.(); event.dataTransfer.setData(tool === 'codex' ? 'application/agentdeck-provider' : 'text/plain', provider.id); }); actions.appendChild(drag);
-
-          const move = document.createElement('button'); move.textContent = '移动到群组'; move.disabled = !providerEnabled; move.addEventListener('click', () => clientPages.codex.send({ action: 'moveProvider', providerId: provider.id })); actions.appendChild(move);
-          const toggle = document.createElement('button'); toggle.textContent = provider.disabled ? '恢复供应商' : '禁用供应商'; toggle.disabled = !enabled || provider.groupDisabled; toggle.addEventListener('click', () => clientPages.codex.send({ action: 'toggleProvider', providerId: provider.id, enabled: Boolean(provider.disabled) })); actions.appendChild(toggle);
-          const template = document.createElement('button'); template.textContent = '载入群组模板'; template.disabled = !providerEnabled; template.addEventListener('click', () => clientPages.codex.send({ action: 'providerTemplate', providerId: provider.id })); actions.appendChild(template);
+        {
+          const move = document.createElement('button'); move.textContent = '移动到群组'; move.disabled = !providerEnabled; move.addEventListener('click', () => clientPages[tool].send({ action: 'moveProvider', providerId: provider.id })); actions.appendChild(move);
+          const template = document.createElement('button'); template.textContent = '载入群组设置'; template.title = '载入默认 API 地址、请求处理和余额规则到编辑草稿；保留密钥、模型、管理令牌和用户 ID。保存并应用后生效。'; template.disabled = !providerEnabled; template.addEventListener('click', () => clientPages[tool].send({ action: 'providerTemplate', providerId: provider.id })); actions.appendChild(template);
+          const note = document.createElement('p'); note.className = 'usageNote'; note.textContent = 'ⓘ 注：载入群组设置可填写默认 API 地址、请求处理和余额查询规则。密钥、模型、管理令牌及网络保持原值；保存并明确应用后才影响客户端。'; item.appendChild(note);
         }
         const configButton = document.createElement('button');
         configButton.textContent = 'Config';
@@ -1303,49 +1388,50 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
         deleteButton.disabled = locked || !providerEnabled;
         deleteButton.addEventListener('click', () => post({ type: 'deleteProvider', providerId: provider.id }));
         const networkButton = document.createElement('button');
-        networkButton.textContent = tool === 'codex' ? '检查连接与额度' : 'Network & Usage';
+        networkButton.textContent = '检查连接与额度';
         networkButton.disabled = locked || !providerEnabled || !provider.hasKey || (provider.tool === 'codex' && provider.codexMode === 'official');
         networkButton.addEventListener('click', () => post({ type: 'testProviderNetwork', providerId: provider.id }));
         actions.appendChild(networkButton);
         const modelButton = document.createElement('button');
-        modelButton.textContent = tool === 'codex' ? '选择模型' : 'Model';
+        modelButton.textContent = '选择模型';
         modelButton.disabled = locked || !providerEnabled || !provider.hasKey || (provider.tool === 'codex' && provider.codexMode === 'official');
         modelButton.addEventListener('click', () => post({ type: 'updateProviderModel', providerId: provider.id }));
         actions.appendChild(modelButton);
         const verifyButton = document.createElement('button');
-        verifyButton.textContent = tool === 'codex' ? '验证所选模型' : 'Verify Model';
+        verifyButton.textContent = '验证所选模型';
         verifyButton.disabled = locked || !providerEnabled || !provider.hasKey || (provider.tool === 'codex' && provider.codexMode === 'official') || !hasConfiguredModel(provider.modelPolicy);
         verifyButton.addEventListener('click', () => post({ type: 'verifyProviderModel', providerId: provider.id }));
         actions.appendChild(verifyButton);
-        for (const runs of tool === 'codex' ? [3] : [1, 3]) {
+        for (const runs of [3]) {
           const speedButton = document.createElement('button');
-          speedButton.textContent = tool === 'codex' ? '测试生成与速度' : runs === 1 ? 'Quick Speed Test' : 'Standard Speed Test';
+          speedButton.textContent = '测试生成与速度';
           speedButton.title = runs + ' real short request(s); uses saved connection settings and model quota; does not Apply';
           const official = provider.codexMode === 'official';
-          speedButton.disabled = locked || !providerEnabled || (official ? state.codexMode !== 'official' : !provider.hasKey || !hasConfiguredModel(provider.modelPolicy));
+          speedButton.disabled = locked || !providerEnabled || (official ? clientMode(tool) !== 'official' : !provider.hasKey || !hasConfiguredModel(provider.modelPolicy));
           speedButton.addEventListener('click', () => post({ type: 'speedTest', providerId: provider.id, runs }));
           actions.appendChild(speedButton);
         }
         actions.appendChild(deleteButton);
-        if (tool === 'codex') {
-          const modelPanel = document.createElement('details'); modelPanel.className = 'submodule'; modelPanel.dataset.fold = 'model:' + provider.id; modelPanel.open = Boolean(foldsByEnvironment[state.sessions?.environmentId]?.[modelPanel.dataset.fold]); const modelTitle = document.createElement('summary'); modelTitle.textContent = '模型'; modelPanel.appendChild(modelTitle);
+        {
+          const modelPanel = document.createElement('details'); modelPanel.className = 'submodule'; modelPanel.dataset.fold = 'model:' + provider.id; modelPanel.open = Boolean(foldsByEnvironment[foldKey()]?.[modelPanel.dataset.fold]); const modelTitle = document.createElement('summary'); modelTitle.textContent = '模型'; modelPanel.appendChild(modelTitle);
           const modelBody = document.createElement('div'); modelBody.className = 'moduleBody'; const modelNote = document.createElement('p'); modelNote.className = 'usageNote'; modelNote.textContent = 'ⓘ 注：刷新列表只更新目录；选择模型会保存默认模型；验证发送一次真实短请求。';
           const refresh = document.createElement('button'); refresh.textContent = '刷新模型列表'; refresh.disabled = locked || !providerEnabled || !provider.hasKey; refresh.addEventListener('click', () => post({ type: 'refreshProviderModels', providerId: provider.id }));
           modelBody.append(modelNote, refresh, modelButton, verifyButton); modelPanel.appendChild(modelBody); item.appendChild(modelPanel);
-          const diagnosis = document.createElement('details'); diagnosis.className = 'submodule'; diagnosis.dataset.fold = 'diagnostics:' + provider.id; diagnosis.open = Boolean(foldsByEnvironment[state.sessions?.environmentId]?.[diagnosis.dataset.fold]); const title = document.createElement('summary'); title.textContent = '供应商诊断'; diagnosis.appendChild(title);
+          const diagnosis = document.createElement('details'); diagnosis.className = 'submodule'; diagnosis.dataset.fold = 'diagnostics:' + provider.id; diagnosis.open = Boolean(foldsByEnvironment[foldKey()]?.[diagnosis.dataset.fold]); const title = document.createElement('summary'); title.textContent = '供应商诊断'; diagnosis.appendChild(title);
           const body = document.createElement('div'); body.className = 'moduleBody'; const note = document.createElement('p'); note.className = 'usageNote'; note.textContent = 'ⓘ 注：连接检查读取模型目录和已启用的额度接口；生成测速执行三次短请求，不会应用此供应商。'; body.append(note, networkButton);
           for (const button of [...actions.children]) if (button.textContent === '测试生成与速度') body.appendChild(button);
           const result = meta.querySelector('.diagnosticResults'); if (result) body.appendChild(result); diagnosis.appendChild(body); item.appendChild(diagnosis);
         }
         item.appendChild(actions);
         for (const button of item.querySelectorAll('button')) button.dataset.disabledIdle = String(button.disabled);
+        if (cached?.node === el.configEditor.parentElement) item.appendChild(el.configEditor);
         if (cached?.node.parentElement) { cached.node.before(item); cached.node.remove(); } else container.appendChild(item);
         providerNodes.set(key, { signature, node: item });
-        if (!el.configEditor.hidden && configEditorProviderId === provider.id && tool === 'codex') container.appendChild(el.configEditor);
+        if (!el.configEditor.hidden && configEditorProviderId === provider.id ) item.appendChild(el.configEditor);
       }
-      if (tool !== 'codex') for (let i = 0; i < providers.length; i++) { const node = providerNodes.get(tool + ':' + providers[i].id)?.node; if (node && [...container.children].filter(n => n.dataset.providerId)[i] !== node) container.appendChild(node); }
-      for (const node of container.querySelectorAll('[data-provider-id]')) { node.draggable = tool === 'claude' && enabled && !busy; for (const button of node.querySelectorAll('button')) button.disabled = busy || button.dataset.disabledIdle === 'true'; }
-      if (!el.configEditor.hidden && tool === 'codex') { const card = providerNodes.get(tool + ':' + configEditorProviderId)?.node; if (card) card.after(el.configEditor); }
+
+      for (const node of container.querySelectorAll('[data-provider-id]')) { node.draggable = enabled && !busy; for (const button of node.querySelectorAll('button')) button.disabled = busy || button.dataset.disabledIdle === 'true'; }
+      if (!el.configEditor.hidden ) { const card = providerNodes.get(tool + ':' + configEditorProviderId)?.node; if (card) card.appendChild(el.configEditor); }
     }
 
     function fetchModels() {
@@ -1361,12 +1447,11 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
     }
 
     function updateAddMode() {
-      const formReadOnly = busy || activeTool === 'codex' && (!codexApiEditable() || !state.toolEnabled.codex);
+      const formReadOnly = busy || (!codexApiEditable() || !state.toolEnabled[activeTool]);
       for (const control of el.form.querySelectorAll('input, select, textarea, button')) control.disabled = formReadOnly;
-      el.tool.disabled = formReadOnly || activeTool === 'claude';
+      el.tool.disabled = formReadOnly;
       updateProxyVisibility('add', el.tool.value);
-      const disabledGroup = activeTool === 'codex' && (state.codexOrganization?.disabledGroups || []).includes(document.getElementById('codexProviderGroup').value);
-      document.getElementById('codexLoadGroupDefaults').disabled = formReadOnly || disabledGroup;
+      const disabledGroup = (state[activeTool + 'Organization']?.disabledGroups || []).includes(document.getElementById('codexProviderGroup').value);
       el.applyNow.disabled = formReadOnly || disabledGroup; if (disabledGroup) el.applyNow.checked = false;
       for (const option of el.tool.options) option.disabled = !state.toolEnabled[option.value];
       el.tool.value = activeTool;
@@ -1452,11 +1537,11 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
           return;
         }
         showAddNotice('Saving provider...', false);
-        post({ type: 'createProvider', payload: { groupId: activeTool === 'codex' ? document.getElementById('codexProviderGroup').value : undefined, tool: el.tool.value, name: el.providerName.value.trim(), key: '', baseUrl: '', model: '', applyNow: el.applyNow.checked, configMode: 'custom', configText: el.addConfigText.value, proxy: getProxyConfig('add') } });
+        post({ type: 'createProvider', payload: { groupId: document.getElementById('codexProviderGroup').value, tool: el.tool.value, name: el.providerName.value.trim(), key: '', baseUrl: '', model: '', applyNow: el.applyNow.checked, configMode: 'custom', configText: el.addConfigText.value, proxy: getProxyConfig('add') } });
         return;
       }
       const payload = {
-        groupId: activeTool === 'codex' ? document.getElementById('codexProviderGroup').value : undefined,
+        groupId: document.getElementById('codexProviderGroup').value,
         tool: el.tool.value,
         name: el.providerName.value.trim(),
         baseUrl: el.baseUrl.value.trim(),
@@ -1480,11 +1565,30 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
       updateSaveState();
     }
 
+    // Unsaved credentials live only in webview memory, never persisted in
+    // vscode.setState. Raw field snapshots also preserve incomplete JSON edits.
+    function rememberConfigDraft() {
+      if (!configEditorProviderId || el.configEditor.hidden) return;
+      configDrafts.set(configEditorTool + ':' + configEditorProviderId, {
+        fields: [...document.getElementById('configEditorBody').querySelectorAll('input, select, textarea')].map(n => ({ id:n.id, value:n.value, checked:n.checked })),
+        originalText:configOriginalText, originalKey:configOriginalKey, originalUsage:configOriginalUsage, originalProxy:configOriginalProxy
+      });
+    }
+    function restoreConfigDraft(groupSettingsLoaded) {
+      const draft = configDrafts.get(configEditorTool + ':' + configEditorProviderId); if (!draft) return;
+      for (const field of draft.fields) {
+        if (groupSettingsLoaded && !['configKey','usageAccessToken','usageUserId'].includes(field.id)) continue;
+        const node = document.getElementById(field.id); if (node) { node.value = field.value; node.checked = field.checked; }
+      }
+      if (!groupSettingsLoaded) { configOriginalText = draft.originalText; configOriginalKey = draft.originalKey; configOriginalUsage = draft.originalUsage; configOriginalProxy = draft.originalProxy; }
+      updateUsageVisibility(); updateProxyVisibility('edit', configEditorTool);
+    }
+
     function setUsageQuery(config) {
       el.usageEnabled.checked = Boolean(config && config.enabled);
       el.usagePreset.value = config && config.preset ? config.preset : 'auto';
-      el.usageUrl.value = config && config.url ? config.url : '{{baseUrl}}/user/balance';
-      el.usageRemainingPath.value = config && config.remainingPath ? config.remainingPath : 'balance';
+      el.usageUrl.value = config?.url ?? '';
+      el.usageRemainingPath.value = config?.remainingPath ?? '';
       el.usageUsedPath.value = config && config.usedPath ? config.usedPath : '';
       el.usageTotalPath.value = config && config.totalPath ? config.totalPath : '';
       el.usageUnit.value = config && config.unit ? config.unit : 'USD';
@@ -1511,42 +1615,32 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
     function applyUsagePreset() {
       const preset = el.usagePreset.value;
       if (preset === 'custom') { updateUsageVisibility(); return; }
-      const values = {
-        auto: ['', '', '', '', 'USD', '1'],
-        generic: ['{{baseUrl}}/user/balance', 'balance', '', '', 'USD', '1'],
-        deepseek: ['{{baseUrl}}/user/balance', 'balance_infos.0.total_balance', '', '', 'USD', '1'],
-        siliconflow: ['{{baseUrl}}/user/info', 'data.balance', '', 'data.totalBalance', 'CNY', '1'],
-        openrouter: ['{{baseUrl}}/key', 'data.limit_remaining', 'data.usage', 'data.limit', 'USD', '1'],
-        newapi: ['{{baseUrl}}/api/user/self', 'data.quota', 'data.used_quota', '', 'USD', '500000']
-      }[preset];
-      if (values) {
-        [el.usageUrl.value, el.usageRemainingPath.value, el.usageUsedPath.value, el.usageTotalPath.value, el.usageUnit.value, el.usageDivisor.value] = values;
-      }
+      const values = balancePresetValues(preset);
+      if (values) for (const [key, value] of Object.entries(values)) el['usage' + key].value = String(value);
       updateUsageVisibility();
     }
 
     function updateUsageVisibility() {
       el.usageFields.hidden = !el.usageEnabled.checked;
-      el.usageAdvancedFields.hidden = el.usagePreset.value !== 'custom';
-      el.newApiFields.hidden = el.usagePreset.value !== 'newapi' && el.usagePreset.value !== 'auto';
+      el.usageAdvancedFields.hidden = el.usagePreset.value === 'auto';
+      if (el.usagePreset.value === 'custom') el.usageAdvancedFields.open = true;
+      const auth = usagePresets.find(item => item.id === el.usagePreset.value)?.auth;
+      el.newApiFields.hidden = !['newapi', 'management'].includes(auth) && el.usagePreset.value !== 'auto';
+      el.usageUserId.hidden = document.getElementById('usageUserIdLabel').hidden = auth !== 'newapi' && el.usagePreset.value !== 'auto';
+      document.getElementById('usagePresetHint').textContent = balancePresetHint(el.usagePreset.value);
     }
 
     function updateActionState() {
-      el.openClaudeButton.disabled = busy || !state.toolEnabled.claude || !findCurrent('claude');
-      el.openCodexButton.disabled = busy || !state.toolEnabled.codex || (state.codexMode !== 'official' && !findCurrent('codex'));
-      el.viewClaudeConfigButton.disabled = busy;
+      el.openCodexButton.disabled = busy || !state.toolEnabled[activeTool] || Boolean(clientSessions()?.restartRequired);
       el.viewCodexConfigButton.disabled = busy;
-      el.refreshClaudeModelsButton.disabled = busy || !state.toolEnabled.claude;
-      el.refreshCodexModelsButton.disabled = busy || !state.toolEnabled.codex || !codexApiEditable();
-      el.testClaudeNetworkButton.disabled = busy || !state.toolEnabled.claude;
-      el.testCodexNetworkButton.disabled = busy || !state.toolEnabled.codex || !codexApiEditable();
-      el.deleteClaudeBackupsButton.disabled = busy || !state.toolEnabled.claude;
+      el.refreshCodexModelsButton.disabled = busy || !state.toolEnabled[activeTool] || !codexApiEditable();
+      el.testCodexNetworkButton.disabled = busy || !state.toolEnabled[activeTool] || !codexApiEditable();
       el.quickOfficialSpeedButton.disabled = !codexIdentityReady('official') || busy || !state.toolEnabled.codex || state.codexMode !== 'official';
       el.standardOfficialSpeedButton.disabled = el.quickOfficialSpeedButton.disabled;
     }
 
     function updateSaveState() {
-      el.saveButton.disabled = busy || el.tool.value === 'codex' && !codexApiEditable() || !state.toolEnabled[el.tool.value] || (el.addMode.value === 'text' && !el.addConfigText.value.trim());
+      el.saveButton.disabled = busy || !codexApiEditable() || !state.toolEnabled[el.tool.value] || (el.addMode.value === 'text' && !el.addConfigText.value.trim());
     }
 
     function setBusy(nextBusy) {
@@ -1580,6 +1674,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
     }
 
     function labelStatus(kind) {
+      if (kind === 'nativeAuth') return '登录状态由原生客户端确认';
       if (kind === 'signedIn') return 'Signed in';
       if (kind === 'loginRequired') return 'Login required';
       if (kind === 'unactivated') return 'Unactivated';
@@ -1666,7 +1761,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
         info.push(formatNetwork(network) + ' | 检查时间：' + time(network.checkedAt));
       }
       if (network || usage || usageEnabled) {
-        const values = usage ? usage.ok ? ['剩余 ' + usage.remaining + (usage.unit ? ' ' + usage.unit : '')] : [usage.error === 'Cancelled' ? 'Cancelled' : 'Unavailable'] : [usageEnabled ? 'Not tested' : 'Not enabled'];
+        const values = usage ? usage.ok ? [usage.unlimited ? 'Key 未设额度上限（不代表账户余额）' : '剩余 ' + usage.remaining + (usage.unit ? ' ' + usage.unit : '')] : [usage.error === 'Cancelled' ? 'Cancelled' : 'Unavailable'] : [usageEnabled ? 'Not tested' : 'Not enabled'];
         if (usage && !usage.ok && usage.httpStatus !== undefined) values.push('HTTP ' + usage.httpStatus);
         row('Usage', values, usage && !usage.ok);
         if (usage) info.push(formatUsage(usage) + ' | 检查时间：' + time(usage.checkedAt));
@@ -1719,7 +1814,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
         return '额度：' + (result.error || '查询失败') + attempts;
       }
       const unit = result.unit || '';
-      const parts = ['额度：' + result.remaining + ' ' + unit];
+      const parts = [result.unlimited ? 'Key 未设额度上限（账户余额未提供）' : '额度：' + result.remaining + ' ' + unit];
       if (result.used !== undefined) parts.push('已用 ' + result.used);
       if (result.total !== undefined) parts.push('总量 ' + result.total);
       if (result.strategy) parts.push(result.strategy);
@@ -1742,7 +1837,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
       }
       if (message.providerId) return 'provider:' + message.providerId;
       if (['applyNetworkProxy', 'restoreNetworkProxy', 'testNetworkProxy', 'networkClipboard', 'networkPreset'].includes(type)) return 'network';
-      if (type === 'applyCodexMode') return 'mode';
+      if ((type === 'applyCodexMode' || type === 'applyClaudeMode')) return 'mode';
       if (type === 'speedTest' || type === 'officialInfo') return 'accounts';
       if (['refreshModels', 'testToolNetwork'].includes(type)) return 'providers';
       if (['exportPublicConfig', 'importPublicConfig'].includes(type)) return 'configuration';
@@ -1760,19 +1855,18 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
     function feedbackAnchor(target) {
       const key = target.slice(target.indexOf(':') + 1);
       if (key.startsWith('provider:')) return Array.from(el.codexProviders.querySelectorAll('[data-provider-id]')).find(node => node.dataset.providerId === key.slice(9)) || el.codexSection;
-      if (key.startsWith('group:')) return clientPages.codex.groupNodes.get(key.slice(6))?.node || el.codexSection;
-      if (key === 'templates') return document.getElementById('codexRequestTemplates');
+      if (key.startsWith('group:')) return clientPages[activeTool].groupNodes.get(key.slice(6))?.node || el.codexSection;
+      if (key === 'templates') return document.getElementById('codexGroupTemplates');
       if (key === 'group-editor') return document.getElementById('codexGroupEditor');
       if (key.startsWith('account:')) return Array.from(sessionsEl.officialAccountsList.children).find(node => node.dataset.identityId === key.slice(8)) || sessionsEl.officialAccountsSection;
       return document.getElementById(({ overview: 'overviewSection', network: 'networkSection', mode: 'sessionPanel', accounts: 'officialAccountsSection', storage: 'codexDataSection', backup: 'codexBackupSection', configuration: 'codexConfigTransferSection', logs: 'codexLogSection', add: 'codexAddProviderDetails', editor: 'configEditor', providers: 'codexProvidersDetails' })[key]);
     }
     function renderFeedback() {
-      if (activeTool === 'codex') el.notice.classList.remove('visible');
+      el.notice.classList.remove('visible');
       for (const node of document.querySelectorAll('[data-operation-feedback]')) node.remove();
       for (const node of document.querySelectorAll('[data-feedback-marker]')) node.remove();
       for (const [key, result] of feedback) {
         if (result.page !== activeTool) continue;
-        if (activeTool === 'claude') { el.notice.textContent = uiText(result.message); el.notice.className = 'notice visible' + (result.status === 'failed' ? ' error' : ''); continue; }
         el.notice.classList.remove('visible');
         const anchor = feedbackAnchor(key); if (!anchor) continue;
         const box = document.createElement('div'); box.dataset.operationFeedback = key;
@@ -1815,7 +1909,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
         if (dismissedReload.has(key)) continue;
         const anchor = document.getElementById(({ network: 'networkSection', mode: 'sessionPanel', storage: 'codexDataSection', providers: 'codexSection' })[notice.section]);
         anchor.classList.add(notice.required ? 'reloadRequired' : 'reloadAdvisory');
-        if (notice.tool === 'codex' && ['mode', 'providers'].includes(notice.section)) { const parent = document.getElementById('codexAccountsSection'); if (notice.required) { parent.classList.remove('reloadAdvisory'); parent.classList.add('reloadRequired'); } else if (!parent.classList.contains('reloadRequired')) parent.classList.add('reloadAdvisory'); }
+        if (['mode', 'providers'].includes(notice.section)) { const parent = document.getElementById('codexAccountsSection'); if (notice.required) { parent.classList.remove('reloadAdvisory'); parent.classList.add('reloadRequired'); } else if (!parent.classList.contains('reloadRequired')) parent.classList.add('reloadAdvisory'); }
         const box = document.createElement('div'); box.dataset.reloadNotice = key; box.className = 'reloadNotice';
         const text = document.createElement('span'); text.textContent = '⚠ ' + notice.reason + (notice.required ? ' · 等待重新加载' : ' · 临时提醒'); box.appendChild(text);
         const button = document.createElement('button'); button.textContent = notice.required ? '重新加载窗口' : '关闭提醒';
@@ -1830,9 +1924,9 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
     function showAddNotice(message, isError) { showLocalFeedback('add', message, isError); }
     function showAddWarning(message) { showLocalFeedback('add', message, true); }
 
+    function foldKey() { const env = clientSessions()?.environmentId || 'local'; return activeTool === 'codex' ? env : 'claude:' + env; }
     function restoreFoldState() {
-      if (activeTool !== 'codex') return;
-      const environment = state.sessions?.environmentId;
+      const environment = foldKey();
       if (!environment || foldEnvironment === environment) return;
       restoringFolds = true; foldEnvironment = environment;
       const saved = foldsByEnvironment[environment] || {};
@@ -1844,7 +1938,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
     }
     document.addEventListener('toggle', event => {
       const details = event.target;
-      if (activeTool !== 'codex' || restoringFolds || !foldEnvironment || !details.dataset?.fold) return;
+      if (customClientIds.includes(activeTool) || restoringFolds || !foldEnvironment || !details.dataset?.fold) return;
       const saved = foldsByEnvironment[foldEnvironment] ||= {};
       saved[details.dataset.fold] = details.open;
       vscode.setState({ ...(vscode.getState() || {}), foldsByEnvironment });
@@ -1852,17 +1946,18 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
 
     function proxyElement(prefix, name) { return document.getElementById(prefix + 'Proxy' + name); }
     function updateProxyVisibility(prefix, tool) {
-      proxyElement(prefix, '').hidden = false;
+      proxyElement(prefix, '').hidden = prefix === 'add';
       proxyElement(prefix, 'ApiFormatField').hidden = tool !== 'codex';
       if (tool !== 'codex') proxyElement(prefix, 'ApiFormat').value = 'anthropic';
       const responses = proxyElement(prefix, 'ApiFormat').value === 'responses';
       proxyElement(prefix, 'ResponsesNote').hidden = !responses;
       for (const name of ['extraThinkingBudget', 'maxThinkingBudget']) proxyElement(prefix, name).disabled = responses;
       proxyElement(prefix, 'Options').hidden = proxyElement(prefix, 'Mode').value !== 'proxy';
+      proxyElement(prefix, 'PresetHint').textContent = proxyPresetDescriptions[proxyElement(prefix, 'Preset').value] || '';
     }
     function setProxyConfig(prefix, config) {
-      const tool = prefix === 'add' ? el.tool.value : prefix === 'edit' ? configEditorTool : 'codex';
-      config = config || { mode: 'direct', preset: 'justdowork' };
+      const tool = prefix === 'add' ? el.tool.value : prefix === 'edit' ? configEditorTool : activeTool;
+      config = config || { mode: 'direct', preset: 'standard' };
       proxyElement(prefix, 'Mode').value = config.mode;
       proxyElement(prefix, 'Preset').value = config.preset;
       const apiFormat = config.apiFormat || (tool === 'codex' ? 'responses' : 'anthropic');
@@ -1874,7 +1969,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
         if (field.type === 'checkbox') field.checked = values[key];
         else field.value = typeof values[key] === 'object' ? JSON.stringify(values[key], null, 2) : String(values[key]);
       }
-      updateProxyVisibility(prefix, prefix === 'add' ? el.tool.value : prefix === 'edit' ? configEditorTool : 'codex');
+      updateProxyVisibility(prefix, prefix === 'add' ? el.tool.value : prefix === 'edit' ? configEditorTool : activeTool);
     }
     function getProxyConfig(prefix) {
       const preset = proxyElement(prefix, 'Preset').value;
@@ -1894,7 +1989,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider, vscode.D
       return { mode: proxyElement(prefix, 'Mode').value, preset, apiFormat, overrides };
     }
     for (const prefix of ['add', 'edit', 'group', 'template']) {
-      proxyElement(prefix, 'Mode').addEventListener('change', () => updateProxyVisibility(prefix, prefix === 'add' ? el.tool.value : prefix === 'edit' ? configEditorTool : 'codex'));
+      proxyElement(prefix, 'Mode').addEventListener('change', () => updateProxyVisibility(prefix, prefix === 'add' ? el.tool.value : prefix === 'edit' ? configEditorTool : activeTool));
       const reset = () => setProxyConfig(prefix, { mode: proxyElement(prefix, 'Mode').value, preset: proxyElement(prefix, 'Preset').value, apiFormat: proxyElement(prefix, 'ApiFormat').value, overrides: {} });
       proxyElement(prefix, 'ApiFormat').addEventListener('change', reset);
       proxyElement(prefix, 'Preset').addEventListener('change', reset);
@@ -1961,7 +2056,7 @@ function feedbackTarget(message: IncomingMessage, page: string): string {
   if (message.type === 'organizationAction') { const i = message.input; return page + ':' + (i.action === 'createGroup' ? 'providers' : i.action === 'saveGroup' || i.action === 'saveTemplate' && i.groupId ? 'group-editor' : ['saveTemplate', 'deleteTemplate'].includes(i.action) ? 'templates' : i.providerId ? 'provider:' + i.providerId : i.groupId ? 'group:' + i.groupId : 'providers'); }
   if ('providerId' in message && message.providerId) return page + ':provider:' + message.providerId;
   if (message.type === 'sessionAction') return page + ':' + (['add', 'rename', 'switch'].includes(message.action) ? 'accounts' : ['backup', 'restore', 'manageBackups', 'deleteHistoryBackups'].includes(message.action) ? 'backup' : message.action === 'exportProviders' ? 'configuration' : 'storage');
-  if (message.type === 'applyCodexMode') return page + ':mode';
+  if ((message.type === 'applyCodexMode' || message.type === 'applyClaudeMode')) return page + ':mode';
   if (['applyNetworkProxy', 'restoreNetworkProxy', 'testNetworkProxy', 'networkClipboard', 'networkPreset'].includes(message.type)) return page + ':network';
   if (['createProvider', 'previewModels'].includes(message.type)) return page + ':add';
   if (['clearLog', 'logAction'].includes(message.type)) return page + ':logs';
@@ -1969,10 +2064,10 @@ function feedbackTarget(message: IncomingMessage, page: string): string {
   return page + ':overview';
 }
 function operationLabel(message: IncomingMessage): string {
-  if (message.type === 'sessionAction') return ({ configure: '连接数据目录', add: '添加账号', rename: '修改账号名称', switch: '切换账号', refresh: '刷新状态', backup: '备份历史', restore: '恢复历史', reload: '重载窗口', openFolder: '打开目录', exportProviders: '保存供应商配置', manageBackups: '浏览历史备份', deleteHistoryBackups: '删除历史备份', help: '打开目录说明' })[message.action];
-  if (message.type === 'organizationAction') return ({ createGroup: '新建群组', renameGroup: '修改群组名称', toggleGroup: '更改群组状态', toggleProvider: '更改供应商状态', moveGroup: '调整群组顺序', moveProvider: '移动供应商', saveGroup: '保存群组模板', saveTemplate: '保存请求处理模板', deleteTemplate: '删除模板', providerTemplate: '载入群组模板', networkDraft: '载入本组网络草稿' })[message.input.action];
+  if (message.type === 'sessionAction') return ({ configure: '连接数据目录', add: '添加账号', rename: '重命名账号档案', switch: '切换账号', refresh: '刷新状态', refreshHistory: '修复原生历史索引', selectHistoryProject: '选择历史项目', clearHistoryProject: '管理已显示历史', labelHistoryProject: '历史标签管理', openNativeHistory: '打开原生扩展', backup: '备份历史', restore: '恢复历史', reload: '重载窗口', openFolder: '打开目录', exportProviders: '保存供应商配置', manageBackups: '浏览历史备份', deleteHistoryBackups: '删除历史备份', help: '打开目录说明' })[message.action];
+  if (message.type === 'organizationAction') return ({ createGroup: '新建群组', renameGroup: '重命名群组', deleteGroup: '删除群组', toggleGroup: '更改群组状态', toggleProvider: '更改供应商状态', moveGroup: '调整群组顺序', moveProvider: '移动供应商', saveGroup: '保存群组设置', saveTemplate: '保存群组设置模板', deleteTemplate: '删除模板', providerTemplate: '载入群组设置' })[message.input.action];
   if (message.type === 'clientAction') return '客户端操作';
-  return ({ networkClipboard: '复制或粘贴网络设置', networkPreset: '管理网络预设', officialInfo: '读取模型与额度', refreshProviderModels: '刷新模型列表', ready: '刷新状态', previewModels: '获取模型列表', createProvider: '保存 Provider', setCurrentProvider: '应用 Provider', applyProvider: '应用 Provider', openProviderConfig: '打开配置', saveProviderConfig: '保存配置', controlProxy: '操作代理', applyCodexMode: '切换登录模式', deleteProvider: '删除 Provider', moveProvider: '调整排序', testProviderNetwork: '测试网络和用量', testToolNetwork: '测试当前连接', testUsageQuery: '查询用量', verifyProviderModel: '验证模型', speedTest: '测速', copySpeedQuery: '复制查询命令', deleteBackups: '删除备份', setToolEnabled: '修改启用状态', updateProviderModel: '选择模型', refreshModels: '刷新模型', openClaudeTerminal: '打开终端', openCodexTerminal: '打开终端', viewConfig: '打开配置文件', exportPublicConfig: '导出 Provider 配置', importPublicConfig: '导入 Provider 配置', clearLog: '删除日志', logAction: '查看或导出日志', applyNetworkProxy: '应用网络设置', restoreNetworkProxy: '恢复网络设置', testNetworkProxy: '测试代理连接' })[message.type];
+  return ({ networkClipboard: '复制或粘贴网络设置', networkPreset: '管理网络预设', officialInfo: '读取模型与额度', refreshProviderModels: '刷新模型列表', ready: '刷新状态', previewModels: '获取模型列表', createProvider: '保存 Provider', setCurrentProvider: '应用 Provider', applyProvider: '应用 Provider', openProviderConfig: '打开配置', saveProviderConfig: '保存配置', controlProxy: '操作代理', applyCodexMode: '切换登录模式', applyClaudeMode: '切换 Claude 登录模式', deleteProvider: '删除 Provider', moveProvider: '调整排序', testProviderNetwork: '测试网络和用量', testToolNetwork: '测试当前连接', testUsageQuery: '查询用量', verifyProviderModel: '验证模型', speedTest: '测速', copySpeedQuery: '复制查询命令', deleteBackups: '删除备份', setToolEnabled: '修改启用状态', updateProviderModel: '选择模型', refreshModels: '刷新模型', openClaudeTerminal: '打开终端', openCodexTerminal: '打开终端', viewConfig: '打开配置文件', exportPublicConfig: '导出 Provider 配置', importPublicConfig: '导入 Provider 配置', clearLog: '删除日志', logAction: '查看或导出日志', applyNetworkProxy: '应用网络设置', restoreNetworkProxy: '恢复网络设置', testNetworkProxy: '测试代理连接' })[message.type];
 }
 export function diagnosticFailure(message: IncomingMessage, state: SidebarViewState): string | undefined {
   const provider = 'providerId' in message ? state.providers.find(p => p.id === message.providerId) : undefined;
@@ -2000,13 +2095,12 @@ export function diagnosticFailure(message: IncomingMessage, state: SidebarViewSt
   }
 }
 function operationSuccess(message: IncomingMessage, state: SidebarViewState): string {
-  if (message.type === 'sessionAction' || message.type === 'applyCodexMode') {
+  if (message.type === 'sessionAction' || (message.type === 'applyCodexMode' || message.type === 'applyClaudeMode')) {
     if (state.sessions?.restartRequired) return '✓ 操作成功。目录或账号绑定已改变，请在登录模式中重载窗口后继续。';
   }
-  if (message.type === 'organizationAction' && message.input.action === 'providerTemplate') return '✓ 群组模板已填入供应商编辑器，请检查后保存；没有改写运行配置。';
-  if (message.type === 'organizationAction' && message.input.action === 'networkDraft') return '✓ 已填入 Codex 网络草稿，请到网络设置核对并明确应用。';
+  if (message.type === 'organizationAction' && message.input.action === 'providerTemplate') return '✓ 群组设置已填入供应商编辑器，请检查后保存；没有改写运行配置。';
   if (message.type === 'saveProviderConfig') return '✓ 配置已保存，点击“应用”后写入到当前环境。';
-  if (message.type === 'applyProvider' || message.type === 'setCurrentProvider') { const pending = state.reloadNotices?.find(n => n.tool === 'codex' && (n.section === 'mode' || n.section === 'providers')); return '✓ 配置已写入。' + (pending?.reason || '已有客户端可能需要重新打开。'); }
+  if (message.type === 'applyProvider' || message.type === 'setCurrentProvider') { const pending = state.reloadNotices?.find(n => n.tool === (message.page ?? 'codex') && (n.section === 'mode' || n.section === 'providers')); return '✓ 配置已写入。' + (pending?.reason || '已有客户端可能需要重新打开。'); }
   if (message.type === 'applyNetworkProxy' || message.type === 'restoreNetworkProxy') return '✓ 网络配置已保存，请按模块中的提示重新加载客户端。';
   if (message.type === 'officialInfo' && state.officialInfo?.unavailable.length) return '查询已完成，部分信息暂不可用，请查看当前账号诊断。';
   if (message.type === 'clearLog') return '✓ 日志已删除；本次删除结果会作为新日志保留。';

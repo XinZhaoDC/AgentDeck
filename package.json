@@ -2,7 +2,7 @@
   "name": "vscodemodelswitch",
   "displayName": "AgentDeck",
   "description": "统一管理 Codex 与 Claude Code 的账号、API 供应商、独立网络和本地聊天历史。",
-  "version": "0.10.0",
+  "version": "0.12.14",
   "publisher": "xinzhaodc",
   "icon": "media/switch_889728.png",
   "license": "SEE LICENSE IN THIRD_PARTY_NOTICES.md",
@@ -169,12 +169,17 @@
     "test:fixed-home": "npm run compile && node scripts/test-fixed-home.js",
     "test:codex-workflows": "npm run compile && node scripts/test-codex-workflows.js",
     "test:provider-groups": "npm run compile && node scripts/test-provider-groups.js",
+    "test:group-settings": "node scripts/test-group-settings.js",
     "test:group-ui": "npm run compile && node scripts/test-group-ui.js",
     "test:group-import": "npm run compile && node scripts/test-group-import.js",
     "test:codex-network": "node scripts/test-codex-network.js",
     "test:codex-diagnostics": "node scripts/test-codex-diagnostics.js",
     "test:native-codex-network": "node scripts/test-native-codex-network.js",
-    "test:codex-release": "python3 scripts/test-codex-release.py"
+    "test:codex-release": "python3 scripts/test-codex-release.py",
+    "test:storage-permissions": "node scripts/test-storage-permissions.js",
+    "test:api-enrollment": "node scripts/test-api-enrollment.js",
+    "test:claude-profiles": "npm run compile && node scripts/test-claude-profiles.js",
+    "test:claude-ui": "npm run compile && node scripts/test-claude-ui.js"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

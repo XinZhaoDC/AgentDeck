@@ -57,6 +57,9 @@ async function main() {
   }
 }
 async function list(profile, root, useDefaultProvider = false) {
+  const { rebuildNativeIndex } = require('../out/clients/codex/history/nativeIndex');
+  const m = await profile.read(), active = m.identities.find(i => i.id === m.activeId);
+  await rebuildNativeIndex(binary, profile.runtimeHome, profile.sqliteHome(active));
   // Do not inherit account tokens, global auth settings or real user HOME.
   const child = spawn(binary, ['app-server'], { cwd: path.join(root, 'project'), env: {
     PATH: process.env.PATH, HOME: root, USERPROFILE: root, XDG_CONFIG_HOME: path.join(root, 'xdg'), CODEX_HOME: profile.runtimeHome,
@@ -74,7 +77,7 @@ async function list(profile, root, useDefaultProvider = false) {
     await send('initialize', { clientInfo: { name: 'modelswitch_fixture', version: '0.8.0' } });
     child.stdin.write('{"method":"initialized"}\n');
     let result;
-    for (let n = 0; n < 10; n++) { result = await send('thread/list', { limit: 100, ...(useDefaultProvider ? {} : { modelProviders: [] }) }); if (result.data?.length) break; await new Promise(r => setTimeout(r, 250)); }
+    for (let n = 0; n < 10; n++) { result = await send('thread/list', { limit: 100, useStateDbOnly: true, ...(useDefaultProvider ? {} : { modelProviders: [] }) }); if (result.data?.length) break; await new Promise(r => setTimeout(r, 250)); }
     if (result.data?.length) for (const thread of useDefaultProvider ? result.data : result.data.slice(0, 1)) await send('thread/read', { threadId: thread.id, includeTurns: true });
     return result;
   } finally {

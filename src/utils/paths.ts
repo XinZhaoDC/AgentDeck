@@ -21,6 +21,12 @@ export function resolveHomePath(...segments: string[]): string {
 
 export function getToolHome(tool: 'codex' | 'claude'): string {
   const sandbox = vscode.workspace.getConfiguration('vscodemodelswitch').get<string>('configTarget', 'real') !== 'real';
+  if (tool === 'claude') {
+    const configured = vscode.workspace.getConfiguration('claudeCode').get<Array<{ name: string; value: string }>>('environmentVariables', []).find(e => e.name === 'CLAUDE_CONFIG_DIR');
+    // The native extension ignores an empty config-dir setting; an inherited
+    // process override still wins. The session controller reports that conflict.
+    if (configured && path.isAbsolute(configured.value)) return path.resolve(configured.value);
+  }
   const override = process.env[tool === 'codex' ? 'CODEX_HOME' : 'CLAUDE_CONFIG_DIR'];
   return !sandbox && override ? path.resolve(override) : resolveHomePath('.' + tool);
 }

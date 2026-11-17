@@ -1,0 +1,22 @@
+'use strict';
+const assert=require('node:assert/strict'),vm=require('node:vm'),Module=require('node:module');let panel;
+const load=Module._load;Module._load=function(name,...args){return name==='vscode'?{ViewColumn:{Active:1},window:{createWebviewPanel(){panel={webview:{html:'',onDidReceiveMessage(fn){panel.receive=fn;}},onDidDispose(fn){panel.closed=fn;},dispose(){panel.closed();}};return panel;}}}:load.call(this,name,...args);};
+const {historyTreeHtml,pickHistoryTree}=require('../out/ui/historyPicker');
+const rows=[{key:'existing',account:'official',environment:'host',project:'project',title:'existing',disabled:true,reason:'已添加',updated:0},{key:'new',account:'official',environment:'host',project:'project',title:'new',disabled:false,updated:0}];
+const html=historyTreeHtml(rows,'add',[]),script=html.match(/<script[^>]*>([\s\S]*)<\/script>/)[1],listeners={},nodes={},messages=[];
+const group={checked:false,disabled:false,matches:s=>s==='.group'||s==='input[type=checkbox]',dataset:{},closest:()=>details};
+const leaf=(key,disabled)=>({dataset:{key},disabled,checked:disabled,matches:s=>s==='input[type=checkbox]'||s==='.leaf',closest:()=>details});
+const existing=leaf('existing',true),fresh=leaf('new',false),duplicate=leaf('new',false),leaves=[existing,fresh,duplicate];
+const details={querySelectorAll:s=>s==='.leaf:not(:disabled)'?leaves.filter(l=>!l.disabled):[],parentElement:{closest:()=>null}};
+for(const id of ['count','submit','filter','cancel'])nodes[id]={textContent:'',disabled:false,addEventListener:(event,fn)=>nodes[id][event]=fn};
+const document={querySelectorAll:s=>s==='.leaf:not(:disabled)'?leaves.filter(l=>!l.disabled):s==='.group'?[group]:[],getElementById:id=>nodes[id],addEventListener:(event,fn)=>listeners[event]=fn};
+vm.runInNewContext(script,{document,acquireVsCodeApi:()=>({postMessage:m=>messages.push(m)})});
+let count=0;const test=async(name,fn)=>{await fn();count++;console.log('PASS '+name);};
+(async()=>{
+ await test('group selection chooses eligible leaves and deduplicates repeated environment entries',()=>{group.checked=true;listeners.change({target:group});assert.ok(existing.checked&&fresh.checked&&duplicate.checked);assert.match(nodes.count.textContent,/1 条/);assert.equal(nodes.submit.disabled,false);});
+ await test('unchecking new selection cannot remove a grey already-added history',()=>{fresh.checked=false;listeners.change({target:fresh});assert.equal(duplicate.checked,false);assert.equal(existing.checked,true);assert.equal(nodes.submit.disabled,true);});
+ await test('submission contains only new unique IDs and leaves disabled rows out',()=>{duplicate.checked=true;listeners.change({target:duplicate});nodes.submit.click();assert.deepEqual(JSON.parse(JSON.stringify(messages.at(-1))),{type:'submit',keys:['new']});});
+ await test('server rejects forged disabled or unknown selections, then accepts eligible keys',async()=>{const pending=pickHistoryTree('Codex',rows,'add');panel.receive({type:'submit',keys:['existing']});assert.equal(panel.closed instanceof Function,true);panel.receive({type:'submit',keys:['unknown']});panel.receive({type:'submit',keys:['new','new']});assert.deepEqual(await pending,['new']);});
+ await test('closing selection is cancellation and never submits an implicit change',async()=>{const pending=pickHistoryTree('Claude',rows,'remove');panel.dispose();assert.equal(await pending,undefined);});
+ console.log(count+' history picker checks passed');
+})().catch(e=>{console.error(e);process.exitCode=1;});

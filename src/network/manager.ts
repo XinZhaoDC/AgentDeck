@@ -16,6 +16,7 @@ interface Field { section: string; key: string; before?: unknown; applied?: unkn
 interface SettingRecovery { id: string; pid: number; failed?: boolean; beforeState?: unknown; beforeBackup?: string; settings: Array<{ section: string; key: string; before?: unknown; after?: unknown }> }
 interface Backup {
   fields: Field[]; claudeBefore: Entry[]; claudeApplied: Entry[]; claudeWasUnset: boolean;
+  claudeFiles?: Array<{ path: string; before: Record<string, unknown>; applied: Record<string, string> }>;
   claudeFile?: { path: string; before: Record<string, unknown>; applied: Record<string, string> };
 }
 export interface NetworkProxyState { config?: NetworkProxyConfig; message?: string; test?: NetworkProxyTest; tools?: Partial<Record<ToolId, { config?: NetworkProxyConfig; message?: string; test?: NetworkProxyTest; managed?: boolean; error?: boolean }>> }
@@ -30,7 +31,7 @@ export class NetworkProxyManager {
   private readonly errors = new Set<ToolId>();
   private readonly managed = new Set<ToolId>();
   readonly ready: Promise<void>;
-  constructor(private readonly context: vscode.ExtensionContext, private readonly environmentState = new EnvironmentState(context)) {
+  constructor(private readonly context: vscode.ExtensionContext, private readonly environmentState = new EnvironmentState(context), private readonly claudeHomes: () => Promise<string[]> = async () => [getToolHome('claude')]) {
     this.loadSaved();
     this.installTransport(); this.ready = this.initialize();
   }
@@ -38,7 +39,11 @@ export class NetworkProxyManager {
     this.configs = {}; this.managed.clear();
     const saved = this.environmentState.get<NetworkProxyConfig | { version: number; tools: Partial<Record<ToolId, NetworkProxyConfig>>; managedTools?: ToolId[] }>(STATE);
     if (saved) {
-      if ('version' in saved) { this.configs = saved.tools; this.version = saved.version; for (const tool of saved.managedTools ?? (saved.version >= 3 ? Object.keys(saved.tools) as ToolId[] : [])) this.managed.add(tool); }
+      if ('version' in saved) {
+        this.configs = saved.tools; this.version = saved.version;
+        // A disabled route may retain an orphan flag from an older version.
+        for (const tool of saved.managedTools ?? (saved.version >= 3 ? Object.keys(saved.tools) as ToolId[] : [])) if (saved.tools[tool]) this.managed.add(tool);
+      }
       else { const c = normalizeNetworkProxy(saved); if (c.claude) this.configs.claude = c; if (c.codex) this.configs.codex = c; this.version = 1; }
     }
   }
@@ -61,8 +66,12 @@ export class NetworkProxyManager {
         }
         if (tool === 'claude' && this.managed.has(tool)) {
           const raw = await this.context.secrets.get(this.environmentState.key(BACKUP));
-          const owned = raw ? (JSON.parse(raw) as Backup).claudeFile : undefined;
-          if (owned && !same(pick(object((await jsonObject(owned.path)).env)), owned.applied)) throw new Error('Claude 网络配置存在外部改动');
+          const saved = raw ? JSON.parse(raw) as Backup : undefined;
+          const owned = saved?.claudeFiles ?? (saved?.claudeFile ? [saved.claudeFile] : []);
+          for (const file of owned) if (!same(pick(object((await jsonObject(file.path)).env)), file.applied)) throw new Error('Claude 网络配置存在外部改动');
+          if (!owned.some(f => f.path === join(getToolHome('claude'), 'settings.json'))) throw new Error('Claude 当前账号目录尚未应用代理');
+          const extension = vscode.workspace.getConfiguration('claudeCode').get<Entry[]>('environmentVariables', []).filter(e => PROXY_ENV_NAMES.includes(e.name));
+          if (saved?.claudeApplied.length && !same(extension, saved.claudeApplied)) throw new Error('Claude 扩展代理变量存在覆盖');
         }
         this.errors.delete(tool);
         this.messages[tool] = this.configs[tool] && !this.managed.has(tool) ? '旧版代理配置尚未迁入独立启动方式；请重新应用或停用恢复。' : '本地配置已核查；实际聊天路由需在客户端验证。';
@@ -110,7 +119,22 @@ export class NetworkProxyManager {
     if (!this.configs[tool]) throw new Error('当前工具尚未启用受管代理。');
     await this.change(tool);
   }
-  private async change(tool: ToolId, config?: NetworkProxyConfig): Promise<void> {
+  async prepareClaudeHome(home: string): Promise<void> {
+    await this.ready;
+    if (this.errors.has('claude')) throw new Error('Claude 网络配置核查异常，请先处理后再切换账号。');
+    if (this.managed.has('claude') && this.configs.claude) {
+      const raw = await this.context.secrets.get(this.environmentState.key(BACKUP));
+      const backup = raw ? JSON.parse(raw) as Backup : undefined;
+      const files = backup?.claudeFiles ?? (backup?.claudeFile ? [backup.claudeFile] : []);
+      const owned = files.find(f => f.path === join(home, 'settings.json'));
+      if (owned) {
+        if (!same(pick(object((await jsonObject(owned.path)).env)), owned.applied)) throw new Error('Claude 目标账号代理字段被外部更改，请先核对。');
+        return;
+      }
+      await this.change('claude', this.configs.claude, [home]);
+    }
+  }
+  private async change(tool: ToolId, config?: NetworkProxyConfig, extraHomes: string[] = []): Promise<void> {
     const key = this.environmentState.key(BACKUP), stored = await this.context.secrets.get(key);
     const backup: Backup = stored ? JSON.parse(stored) : { fields: [], claudeBefore: [], claudeApplied: [], claudeWasUnset: true };
     const next = { ...this.configs }; if (config) next[tool] = config; else delete next[tool];
@@ -128,16 +152,21 @@ export class NetworkProxyManager {
     try {
       await FileRecovery.run(this.directory(tool), async tx => {
         if (tool === 'claude') {
-          const file = join(getToolHome('claude'), 'settings.json'), settings = await jsonObject(file);
-          const env = object(settings.env), owned = backup.claudeFile;
-          if (owned && (owned.path !== file || !same(pick(env), owned.applied))) throw new Error('Claude 代理字段已在外部更改，请先核对，不会覆盖。');
-          if (config) {
-            const applied = this.envFor(config);
-            backup.claudeFile = { path: file, before: owned?.before ?? pick(env), applied };
-            settings.env = { ...env, ...applied };
-          } else if (owned) { settings.env = { ...omit(env), ...owned.before }; delete backup.claudeFile; }
-          await tx.write(file, JSON.stringify(settings, null, 2) + '\n');
-          if (!same(pick(object((await jsonObject(file)).env)), pick(object(settings.env)))) throw new Error('Claude 配置写入校验失败。');
+          const ownedFiles = backup.claudeFiles ?? (backup.claudeFile ? [backup.claudeFile] : []);
+          const paths = [...new Set([...ownedFiles.map(f => f.path), ...((config ? [...await this.claudeHomes(), ...extraHomes] : []).map(home => join(home, 'settings.json')))])];
+          const nextFiles: NonNullable<Backup['claudeFiles']> = [];
+          for (const file of paths) {
+            const settings = await jsonObject(file), env = object(settings.env), owned = ownedFiles.find(f => f.path === file);
+            if (owned && !same(pick(env), owned.applied)) throw new Error('Claude 代理字段已在外部更改，请先核对，不会覆盖。');
+            if (config) {
+              const applied = this.envFor(config);
+              nextFiles.push({ path: file, before: owned?.before ?? pick(env), applied });
+              settings.env = { ...env, ...applied };
+            } else if (owned) settings.env = { ...omit(env), ...owned.before };
+            await tx.write(file, JSON.stringify(settings, null, 2) + '\n');
+            if (!same(pick(object((await jsonObject(file)).env)), pick(object(settings.env)))) throw new Error('Claude 配置写入校验失败。');
+          }
+          backup.claudeFiles = nextFiles; delete backup.claudeFile;
           const section = vscode.workspace.getConfiguration('claudeCode');
           const entries = section.get<Entry[]>('environmentVariables', []), before = ownValue(section, 'environmentVariables');
           if (backup.claudeApplied.length && !same(entries.filter(e => PROXY_ENV_NAMES.includes(e.name)), backup.claudeApplied)) throw new Error('旧版 Claude 插件代理变量已被外部更改。');
@@ -173,7 +202,7 @@ export class NetworkProxyManager {
           backup.fields = [];
         }
         await this.context.secrets.store(key, JSON.stringify(backup));
-        await this.environmentState.update(STATE, { version: 3, tools: next, managedTools: [...new Set([...this.managed, tool])] });
+        await this.environmentState.update(STATE, { version: 3, tools: next, managedTools: [...new Set([...this.managed, tool])].filter(id => Boolean(next[id])) });
         await tx.write(this.marker(tool), JSON.stringify({ id: pending.id }));
       });
     } catch (error) {

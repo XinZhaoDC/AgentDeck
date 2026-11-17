@@ -37,8 +37,10 @@ async function worker() {
   let pickedFolder, takeOver = false;
   const official = path.join(home, 'official', 'bin', 'linux-' + (process.arch === 'x64' ? 'x86_64' : 'aarch64'));
   await fsp.mkdir(official, { recursive: true }); await fsp.writeFile(path.join(official, 'codex'), '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+  const nativeIndexFixture = path.join(home,'native-index-fixture.js');
+  await fsp.writeFile(nativeIndexFixture, `const rl=require('node:readline').createInterface({input:process.stdin});rl.on('line',line=>{const m=JSON.parse(line);if(!m.id)return;console.log(JSON.stringify({id:m.id,result:m.method==='initialize'?{}:{data:[{id:'synthetic-indexed-thread'}],nextCursor:null}}));});`);
   const vscode = {
-    extensions: { getExtension: () => ({ extensionUri: { fsPath: path.join(home, 'official') } }) },
+    extensions: { getExtension: () => ({ extensionUri: { fsPath: path.join(home, 'official') }, extensionPath: path.join(home, 'official') }) },
     env: remote ? { remoteName: 'dev-container' } : {},
     Uri: { file: fsPath => ({ fsPath }), joinPath: (base, ...parts) => ({ fsPath: path.join(base.fsPath, ...parts) }) },
     RelativePattern: class {}, ConfigurationTarget: { Global: 1 }, StatusBarAlignment: { Left: 1 },
@@ -53,7 +55,7 @@ async function worker() {
     workspace: {
       createFileSystemWatcher: () => ({ onDidCreate: disposable, onDidChange: disposable, onDidDelete: disposable, dispose() {} }),
       getConfiguration(section) {
-        if (section === 'vscodemodelswitch') return { get: (key, fallback) => ({ configTarget: 'sandbox', testHome: home, globalCliSync: true })[key] ?? fallback };
+        if (section === 'vscodemodelswitch') return { get: (key, fallback) => ({ configTarget: 'sandbox', testHome: home, globalCliSync: true, codexExecutablePath: nativeIndexFixture })[key] ?? fallback };
         const host = read(hostSettings), own = read(ownSettings);
         const localProxy = remote && own['http.useLocalProxyConfiguration'] !== false;
         const effective = key => {
@@ -278,7 +280,7 @@ async function main() {
       assert.equal(await auth('workflow'), '');
     });
     await flow.call('exit'); flow = await start('workflow');
-    await test('after reload API Apply preserves shared index path and does not create permanent bak files', async () => {
+    await test('after reload API Apply preserves private index path and does not create permanent bak files', async () => {
       await flow.call('apply', { provider: B }); const state = await flow.call('state');
       assert.equal(state.mode, 'api'); assert.equal(state.sessions.activeId, apiId);
       assert.match(await bytes('workflow'), /sqlite_home/);

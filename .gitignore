@@ -32,3 +32,30 @@ scripts/proxy-test-sandbox/**
 **/.modelswitch-environment.json
 **/*.before
 **/thread_history_*.sqlite*
+
+# Claude native credentials and profile selection recovery never ship.
+**/.credentials.json
+**/.claude.json
+**/claude-history-*/**
+**/.agentdeck-profile.json
+**/selection.pending.json
+
+# Native project correspondence metadata and transaction journals.
+**/project-mappings.json
+**/.project-mapping-recovery/**
+
+**/history-browse.json
+**/history-catalog.json
+**/.history-browse-recovery/**
+**/.history-catalog-recovery/**
+
+**/history-imports.json
+**/history-imports/**
+**/.history-import-recovery/**
+
+**/history-labels.json
+**/.history-label-recovery/**
+
+# Native API source bindings and per-session receipts are private runtime metadata.
+**/.agentdeck-api-source.json
+**/history-sources/**

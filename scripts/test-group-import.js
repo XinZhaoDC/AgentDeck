@@ -11,7 +11,7 @@ async function main(){
  let providers=[provider('a','Account'),provider('cc','Account','claude')];const shared=new Map(),local=new Map();const storage=(map,sharedStore=false)=>({get:(k,d)=>structuredClone(map.get(k)??d),update:async(k,v)=>{if(sharedStore&&failOrganization){failOrganization=false;throw Error('injected metadata failure');}map.set(k,structuredClone(v));}});
  const org=new ProviderOrganizationStore('codex',storage(shared,true),storage(local),()=>providers);const app=Object.create(VSModelSwitchApp.prototype);
  app.store={getProviders:()=>structuredClone(providers),getProvidersByTool:t=>structuredClone(providers.filter(p=>p.tool===t)),getProvider:id=>providers.find(p=>p.id===id),saveProviders:async p=>{providers=structuredClone(p);},setCurrentProviderId(){throw Error('Import must not switch current provider');}};
- app.codexOrganization=org;app.sessionController={state:async()=>({root})};app.refreshStatus=()=>{};
+ app.codexOrganization=org;app.claudeOrganization=new ProviderOrganizationStore('claude',storage(shared,true),storage(local),()=>providers);app.sessionController={state:async()=>({root})};app.refreshStatus=()=>{};
  const sentinel=path.join(root,'runtime-config.toml');await fs.writeFile(sentinel,'original client file');app.codexAdapter={getConfigPath:()=>sentinel};
  const group=await org.createGroup('Site');await org.createGroup('Empty');await org.assignNewProvider('a',group);await org.saveTemplate('Reusable',{mode:'proxy',preset:'custom',apiFormat:'responses',overrides:{timeoutMs:12345}});await org.setProviderEnabled('a',false);
  const write=async value=>{source=path.join(root,'import.json');await fs.writeFile(source,JSON.stringify(value));};
@@ -25,6 +25,14 @@ async function main(){
  await test('partial organization persistence failure rolls providers and the prior group catalog back',async()=>{const old=structuredClone(providers),catalog=org.read();await write({version:2,providers:[provider('replacement','Replacement')],organizations:{codex:emptyOrganization()}});mode='replace';failOrganization=true;await assert.rejects(app.importPublicConfig('codex'),/injected metadata failure/);assert.deepEqual(providers,old);assert.deepEqual(org.read(),catalog);});
  await test('Claude-page exports and imports are confined to Claude and leave Codex organization untouched',async()=>{destination=path.join(root,'claude-export.json');await app.exportPublicConfig('claude');const file=JSON.parse(await fs.readFile(destination));assert.ok(file.providers.every(p=>p.tool==='claude'));const before=JSON.stringify(providers.filter(p=>p.tool==='codex')),catalog=org.read();await write(file);mode='replace';await app.importPublicConfig('claude');assert.equal(JSON.stringify(providers.filter(p=>p.tool==='codex')),before);assert.deepEqual(org.read(),catalog);});
  await test('unknown secret-like template fields are not retained and credential URLs are rejected',async()=>{const catalog=emptyOrganization();catalog.templates.push({id:'clean',name:'Clean',proxy:{mode:'direct',preset:'custom',apiFormat:'responses'},apiKey:'synthetic-secret'});await write({version:2,providers:[provider('a','Account')],organizations:{codex:catalog}});mode='replace';await app.importPublicConfig('codex');assert.ok(!JSON.stringify(org.read()).includes('synthetic-secret'));catalog.groups[0].defaults={baseUrl:'https://user:secret@fixture.invalid',proxy:{mode:'direct',preset:'custom'}};await write({version:2,providers:[],organizations:{codex:catalog}});await assert.rejects(app.importPublicConfig('codex'),/凭据/);});
+ await test('Claude imports reject normalized duplicate API and group names before changing either client',async()=>{
+   const before=structuredClone(providers),catalog=app.claudeOrganization.read();mode='merge';
+   await write({version:1,providers:[provider('cc-duplicate',' ＡＣＣＯＵＮＴ ','claude')]});
+   await assert.rejects(app.importPublicConfig('claude'),/名称重复/);assert.deepEqual(providers,before);
+   const incoming=emptyOrganization();incoming.groups.push({id:'x',name:' Same '},{id:'y',name:'Ｓａｍｅ'});
+   await write({version:2,providers:[],organizations:{claude:incoming}});
+   await assert.rejects(app.importPublicConfig('claude'),/同名/);assert.deepEqual(providers,before);assert.deepEqual(app.claudeOrganization.read(),catalog);
+ });
  console.log('RESULT: '+passed+' group import/export checks passed; retained fixture '+root);
 }
 main().finally(()=>{Module._load=original;}).catch(e=>{console.error(e);process.exitCode=1;});
